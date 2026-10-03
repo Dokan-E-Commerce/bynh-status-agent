@@ -102,7 +102,18 @@ pub async fn spawn_target() -> SocketAddr {
                     format!("method={m} body={body} x-probe={probe}")
                 }),
             )
-            .route("/post-303", post(|| async { Redirect::to("/echo") }));
+            .route("/post-303", post(|| async { Redirect::to("/echo") }))
+            .route(
+                "/to-nonascii",
+                get(|| async {
+                    let mut r = StatusCode::FOUND.into_response();
+                    r.headers_mut().insert(
+                        header::LOCATION,
+                        axum::http::HeaderValue::from_bytes(b"/ok?q=\xc3\xbc").unwrap(),
+                    );
+                    r
+                }),
+            );
     serve(app).await
 }
 

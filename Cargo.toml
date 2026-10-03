@@ -39,6 +39,9 @@ url = "2.5.8"
 webpki-roots = "1.0.9"
 x509-parser = "0.18.1"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 axum = "0.8.9"
 rcgen = "0.14.10"

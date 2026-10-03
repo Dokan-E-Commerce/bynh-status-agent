@@ -50,7 +50,8 @@ async fn hello_assignments_304_and_results() {
     assert_eq!(s.hello_calls.len(), 1);
     let h = &s.hello_calls[0].headers;
     assert_eq!(h["authorization"], format!("Bearer {TOKEN}").as_str());
-    assert_eq!(h["x-bynh-status-agent-protocol"], "1");
+    // Literal on purpose: this is the name in PROTOCOL.md, not our constant.
+    assert_eq!(h["X-Bynh-Agent-Protocol"], "1");
     let ua = h["user-agent"].to_str().unwrap();
     assert!(
         ua.starts_with("bynh-status-agent/1.") && ua.contains("; "),

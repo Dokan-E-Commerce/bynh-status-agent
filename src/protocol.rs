@@ -8,6 +8,31 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// Value of the `X-Bynh-Agent-Protocol` header.
 pub const PROTOCOL_VERSION: &str = "1";
 
+/// Header carrying [`PROTOCOL_VERSION`] on every platform request.
+pub const PROTOCOL_HEADER: &str = "X-Bynh-Agent-Protocol";
+/// Platform endpoints (relative to `api_url`).
+pub const PATH_HELLO: &str = "/api/v1/agent/hello";
+pub const PATH_ASSIGNMENTS: &str = "/api/v1/agent/assignments";
+pub const PATH_RESULTS: &str = "/api/v1/agent/results";
+/// Methods a check may use.
+pub const METHODS: &[&str] = &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+
+/// Bounds applied to assignments, so a broken or hostile platform response
+/// can't exhaust the agent.
+pub mod limits {
+    pub const MAX_CHECKS: usize = 10_000;
+    pub const MAX_ID: usize = 128;
+    pub const MAX_URL: usize = 8 * 1024;
+    pub const MAX_HOST: usize = 253;
+    pub const MAX_HEADERS: usize = 50;
+    pub const MAX_HEADER_VALUE: usize = 8 * 1024;
+    pub const MAX_BODY: usize = 64 * 1024;
+    pub const MAX_KEYWORD: usize = 1024;
+    pub const MAX_INTERVAL_SECONDS: u64 = 86_400;
+    pub const MAX_TIMEOUT_MS: u64 = 120_000;
+    pub const MAX_REDIRECTS: u32 = 20;
+}
+
 /// Version of this agent build.
 pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -106,26 +131,46 @@ struct RawAssignments {
 pub struct Assignments {
     pub config_version: String,
     pub checks: Vec<Check>,
-    /// Checks that could not be understood (id if known, reason).
-    pub skipped: Vec<(Option<String>, String)>,
+    /// Checks that could not be understood: (id if printable, reason). The
+    /// reason is a fixed category and never contains values from the check.
+    pub skipped: Vec<(Option<String>, &'static str)>,
+    /// Checks beyond [`limits::MAX_CHECKS`] that were ignored.
+    pub truncated: usize,
 }
 
 impl Assignments {
     pub fn parse(body: &[u8]) -> Result<Self, serde_json::Error> {
         let raw: RawAssignments = serde_json::from_slice(body)?;
-        let mut checks = Vec::with_capacity(raw.checks.len());
+        let total = raw.checks.len();
+        let mut checks = Vec::with_capacity(total.min(limits::MAX_CHECKS));
         let mut skipped = Vec::new();
-        for value in raw.checks {
-            let id = value.get("id").and_then(|v| v.as_str()).map(str::to_owned);
+        for value in raw.checks.into_iter().take(limits::MAX_CHECKS) {
+            let id = value
+                .get("id")
+                .and_then(|v| v.as_str())
+                .filter(|s| printable_id(s))
+                .map(str::to_owned);
+            let known = matches!(
+                value.get("type").and_then(|v| v.as_str()),
+                Some("http" | "keyword" | "tcp" | "tls")
+            );
+            if !known {
+                skipped.push((id, "unsupported check type"));
+                continue;
+            }
             match serde_json::from_value::<Check>(value) {
-                Ok(c) => checks.push(c),
-                Err(e) => skipped.push((id, e.to_string())),
+                Ok(c) => match c.validate() {
+                    Ok(c) => checks.push(c),
+                    Err(reason) => skipped.push((id, reason)),
+                },
+                Err(_) => skipped.push((id, "invalid field types")),
             }
         }
         Ok(Self {
             config_version: raw.config_version,
             checks,
             skipped,
+            truncated: total.saturating_sub(limits::MAX_CHECKS),
         })
     }
 }
@@ -256,7 +301,79 @@ impl fmt::Debug for Check {
     }
 }
 
+/// Ids that are safe to print in logs.
+fn printable_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= limits::MAX_ID
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+}
+
 impl Check {
+    /// Checks limits and normalises a check from the platform. Errors are
+    /// fixed descriptions that never echo the offending value.
+    pub fn validate(mut self) -> Result<Self, &'static str> {
+        use limits::*;
+        if self.id.is_empty() || self.id.len() > MAX_ID {
+            return Err("id missing or too long");
+        }
+        let method = self.method.trim().to_ascii_uppercase();
+        if !METHODS.contains(&method.as_str()) {
+            return Err("method not allowed");
+        }
+        self.method = method;
+        self.interval_seconds = self.interval_seconds.clamp(1, MAX_INTERVAL_SECONDS);
+        self.timeout_ms = self.timeout_ms.clamp(1, MAX_TIMEOUT_MS);
+        self.max_redirects = self.max_redirects.min(MAX_REDIRECTS);
+        if let Some(u) = &self.url {
+            if u.len() > MAX_URL {
+                return Err("url too long");
+            }
+            let parsed = url::Url::parse(u).map_err(|_| "invalid url")?;
+            if parsed.host().is_none() {
+                return Err("url has no host");
+            }
+            if matches!(self.kind, CheckType::Http | CheckType::Keyword)
+                && !matches!(parsed.scheme(), "http" | "https")
+            {
+                return Err("url scheme must be http or https");
+            }
+        } else if matches!(self.kind, CheckType::Http | CheckType::Keyword) {
+            return Err("url missing");
+        }
+        if let Some(h) = &self.host {
+            if h.is_empty() {
+                self.host = None;
+            } else {
+                self.host = Some(crate::net::normalize_host(h).map_err(|_| "invalid host")?);
+            }
+        }
+        if matches!(self.kind, CheckType::Tcp | CheckType::Tls)
+            && self.host.is_none()
+            && self.url.is_none()
+        {
+            return Err("host missing");
+        }
+        if self.headers.len() > MAX_HEADERS {
+            return Err("too many headers");
+        }
+        for (k, v) in &self.headers {
+            if v.len() > MAX_HEADER_VALUE
+                || http::HeaderName::from_bytes(k.trim().as_bytes()).is_err()
+                || http::HeaderValue::from_str(v).is_err()
+            {
+                return Err("invalid header");
+            }
+        }
+        if self.body.as_ref().is_some_and(|b| b.len() > MAX_BODY) {
+            return Err("body too large");
+        }
+        if self.keyword.as_ref().is_some_and(|k| k.len() > MAX_KEYWORD) {
+            return Err("keyword too long");
+        }
+        Ok(self)
+    }
+
     /// A bare check with protocol defaults, used by `bynh-status-agent check` and tests.
     pub fn new(id: impl Into<String>, kind: CheckType) -> Self {
         Self {
@@ -423,7 +540,10 @@ mod tests {
         assert_eq!(a.config_version, "c_8f2");
         assert_eq!(a.checks.len(), 2);
         assert_eq!(a.skipped.len(), 1);
-        assert_eq!(a.skipped[0].0.as_deref(), Some("mon_future"));
+        assert_eq!(
+            a.skipped[0],
+            (Some("mon_future".to_owned()), "unsupported check type")
+        );
         let c = &a.checks[0];
         assert_eq!(c.ip_version, IpVersion::V4);
         assert!(matches!(c.auth, Some(Auth::Basic { .. })));
@@ -432,6 +552,110 @@ mod tests {
         assert_eq!(tcp.port, Some(5432));
         assert_eq!(tcp.method, "GET");
         assert!(tcp.follow_redirects && tcp.verify_tls);
+    }
+
+    fn check_json(extra: serde_json::Value) -> serde_json::Value {
+        let mut v =
+            serde_json::json!({ "id": "mon_1", "type": "http", "url": "https://example.com/" });
+        for (k, val) in extra.as_object().unwrap() {
+            v[k] = val.clone();
+        }
+        v
+    }
+
+    fn parse_one(extra: serde_json::Value) -> Assignments {
+        let doc = serde_json::json!({ "config_version": "c", "checks": [check_json(extra)] });
+        Assignments::parse(&serde_json::to_vec(&doc).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn limits_and_normalisation() {
+        use serde_json::json;
+        let ok = parse_one(
+            json!({ "method": "post", "interval_seconds": u64::MAX, "timeout_ms": 0, "max_redirects": 1000 }),
+        );
+        let c = &ok.checks[0];
+        assert_eq!(c.method, "POST");
+        assert_eq!(c.interval_seconds, limits::MAX_INTERVAL_SECONDS);
+        assert_eq!(c.timeout_ms, 1);
+        assert_eq!(c.max_redirects, limits::MAX_REDIRECTS);
+        let i = parse_one(json!({ "interval_seconds": 0 }));
+        assert_eq!(i.checks[0].interval_seconds, 1);
+
+        let many: serde_json::Map<String, serde_json::Value> =
+            (0..51).map(|i| (format!("x-h{i}"), json!("v"))).collect();
+        for (extra, reason) in [
+            (json!({ "method": "TRACE" }), "method not allowed"),
+            (json!({ "method": "GET\r\nX: y" }), "method not allowed"),
+            (json!({ "id": "x".repeat(129) }), "id missing or too long"),
+            (
+                json!({ "url": format!("https://example.com/{}", "a".repeat(9000)) }),
+                "url too long",
+            ),
+            (
+                json!({ "url": "ftp://example.com/" }),
+                "url scheme must be http or https",
+            ),
+            (json!({ "headers": many }), "too many headers"),
+            (
+                json!({ "headers": { "x-a": "v".repeat(8193) } }),
+                "invalid header",
+            ),
+            (
+                json!({ "headers": { "x-a": "bad\r\nInjected: 1" } }),
+                "invalid header",
+            ),
+            (json!({ "headers": { "bad name": "v" } }), "invalid header"),
+            (json!({ "body": "b".repeat(65_537) }), "body too large"),
+            (json!({ "keyword": "k".repeat(1025) }), "keyword too long"),
+            (json!({ "timeout_ms": "soon" }), "invalid field types"),
+        ] {
+            let a = parse_one(extra);
+            assert!(a.checks.is_empty());
+            assert_eq!(a.skipped[0].1, reason);
+        }
+    }
+
+    #[test]
+    fn rejects_host_injection() {
+        use serde_json::json;
+        for host in [
+            "evil.com:443 HTTP/1.1\r\nHost: x\r\n\r\nGET /admin",
+            "a b",
+            "host/../x",
+            "user@host",
+            "[::1]x",
+        ] {
+            let a = parse_one(json!({ "type": "tcp", "url": null, "host": host, "port": 1 }));
+            assert!(a.checks.is_empty(), "{host:?} accepted");
+            assert_eq!(a.skipped[0].1, "invalid host");
+        }
+        let a =
+            parse_one(json!({ "type": "tcp", "url": null, "host": "[2001:db8::1]", "port": 1 }));
+        assert_eq!(a.checks[0].host.as_deref(), Some("2001:db8::1"));
+        let a = parse_one(
+            json!({ "type": "tls", "url": null, "host": "Shop.Example.COM", "port": 443 }),
+        );
+        assert_eq!(a.checks[0].host.as_deref(), Some("shop.example.com"));
+    }
+
+    #[test]
+    fn caps_the_number_of_checks() {
+        let checks: Vec<_> = (0..limits::MAX_CHECKS + 5)
+            .map(|i| serde_json::json!({ "id": format!("m{i}"), "type": "tcp", "host": "example.com", "port": 1 }))
+            .collect();
+        let doc = serde_json::json!({ "config_version": "c", "checks": checks });
+        let a = Assignments::parse(&serde_json::to_vec(&doc).unwrap()).unwrap();
+        assert_eq!(a.checks.len(), limits::MAX_CHECKS);
+        assert_eq!(a.truncated, 5);
+    }
+
+    #[test]
+    fn skipped_reasons_never_echo_values() {
+        let a = parse_one(
+            serde_json::json!({ "timeout_ms": "secret-value", "id": "bad id with spaces" }),
+        );
+        assert_eq!(a.skipped[0], (None, "invalid field types"));
     }
 
     #[test]

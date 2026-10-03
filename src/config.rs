@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::netguard::Cidr;
 use crate::proxy::ProxySettings;
 
 pub const DEFAULT_API_URL: &str = "https://api.bynh.io";
@@ -14,12 +15,13 @@ pub const MAX_CONCURRENCY: usize = 4096;
 /// Name of the systemd credential holding the token (see `deploy/systemd`).
 pub const SYSTEMD_CREDENTIAL: &str = "bynh-token";
 
-/// Default config locations, tried in order when `--config` is not given.
+/// Default config location, used when `--config` is not given. There is
+/// deliberately no working-directory fallback: a stray file in whatever
+/// directory the agent starts from must not change its behaviour.
 pub fn default_paths() -> Vec<PathBuf> {
-    vec![
-        PathBuf::from("/etc/bynh-status-agent/bynh-status-agent.toml"),
-        PathBuf::from("bynh-status-agent.toml"),
-    ]
+    vec![PathBuf::from(
+        "/etc/bynh-status-agent/bynh-status-agent.toml",
+    )]
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -40,6 +42,10 @@ pub struct Config {
     pub proxy: ProxySettings,
     /// Send checks through the proxy too. Requires `allow_private`.
     pub check_via_proxy: bool,
+    /// Accept a plain-http `api_url` that isn't loopback.
+    pub insecure_api_url: bool,
+    /// Networks checks may never reach, even with `allow_private`.
+    pub deny_cidrs: Vec<Cidr>,
     /// Where the settings came from (for the startup log line).
     pub source: Option<PathBuf>,
 }
@@ -66,6 +72,8 @@ impl fmt::Debug for Config {
             .field("ca_file", &self.ca_file)
             .field("proxy", &self.proxy.describe())
             .field("check_via_proxy", &self.check_via_proxy)
+            .field("insecure_api_url", &self.insecure_api_url)
+            .field("deny_cidrs", &self.deny_cidrs)
             .field("source", &self.source)
             .finish()
     }
@@ -102,6 +110,8 @@ impl Default for Config {
             ca_file: None,
             proxy: ProxySettings::default(),
             check_via_proxy: false,
+            insecure_api_url: false,
+            deny_cidrs: Vec::new(),
             source: None,
         }
     }
@@ -124,6 +134,8 @@ struct FileConfig {
     proxy_url: Option<String>,
     no_proxy: Option<String>,
     check_via_proxy: Option<bool>,
+    insecure_api_url: Option<bool>,
+    deny_cidrs: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -176,7 +188,7 @@ impl Config {
             Some(p) => {
                 let text = std::fs::read_to_string(p)
                     .map_err(|e| err(format!("config {}: {e}", p.display())))?;
-                toml::from_str(&text).map_err(|e| err(format!("config {}: {e}", p.display())))?
+                toml::from_str(&text).map_err(|e| err(toml_error(p, &text, &e)))?
             }
             None => FileConfig::default(),
         };
@@ -275,7 +287,30 @@ impl Config {
             }
         }
 
-        c.api_url = normalize_api_url(&c.api_url)?;
+        c.insecure_api_url = match env("BYNH_INSECURE_API_URL") {
+            Some(v) => parse_bool("BYNH_INSECURE_API_URL", &v)?,
+            None => file.insecure_api_url.unwrap_or(false),
+        };
+        let deny: Vec<String> = match env("BYNH_DENY_CIDRS") {
+            Some(v) => v
+                .split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            None => file.deny_cidrs.unwrap_or_default(),
+        };
+        c.deny_cidrs = deny
+            .iter()
+            .map(|d| {
+                Cidr::parse(d).ok_or_else(|| {
+                    err(format!(
+                        "deny_cidrs: {d:?} is not an IP address or CIDR range"
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
+        c.api_url = normalize_api_url(&c.api_url, c.insecure_api_url)?;
         Ok(c)
     }
 
@@ -294,19 +329,43 @@ impl Config {
     }
 }
 
-fn normalize_api_url(raw: &str) -> Result<String, ConfigError> {
-    let u = url::Url::parse(raw.trim()).map_err(|e| err(format!("api_url {raw:?}: {e}")))?;
+/// Describes a TOML error by message and line only. The parser's own
+/// rendering quotes the offending line, which may be the token.
+fn toml_error(path: &Path, text: &str, e: &toml::de::Error) -> String {
+    let line = e
+        .span()
+        .map(|sp| text[..sp.start.min(text.len())].matches('\n').count() + 1);
+    match line {
+        Some(l) => format!("config {}: line {l}: {}", path.display(), e.message()),
+        None => format!("config {}: {}", path.display(), e.message()),
+    }
+}
+
+/// True for an `api_url` that uses plain http to a non-loopback host.
+pub fn is_insecure_api_url(api_url: &str) -> bool {
+    url::Url::parse(api_url).is_ok_and(|u| u.scheme() == "http" && !is_loopback_host(&u))
+}
+
+fn is_loopback_host(u: &url::Url) -> bool {
+    match u.host() {
+        Some(url::Host::Domain(d)) => d == "localhost",
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+fn normalize_api_url(raw: &str, insecure_ok: bool) -> Result<String, ConfigError> {
+    let u =
+        url::Url::parse(raw.trim()).map_err(|e| err(format!("api_url is not a valid URL: {e}")))?;
     match u.scheme() {
         "https" => {}
         "http" => {
-            let local = match u.host() {
-                Some(url::Host::Domain(d)) => d == "localhost",
-                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-                None => false,
-            };
-            if !local {
-                tracing::warn!("api_url uses plain http; the agent token will travel unencrypted");
+            if !is_loopback_host(&u) && !insecure_ok {
+                return Err(err(
+                    "api_url uses plain http, which would send the agent token unencrypted; use https, \
+                     or set insecure_api_url = true (BYNH_INSECURE_API_URL) if you really mean it",
+                ));
             }
         }
         s => return Err(err(format!("api_url: unsupported scheme {s:?}"))),
@@ -508,6 +567,61 @@ mod tests {
         .unwrap();
         assert!(c.check_via_proxy);
         assert!(Config::load(None, &[], &env_of(&[("BYNH_PROXY_URL", "socks5://x:1")])).is_err());
+    }
+
+    #[test]
+    fn plain_http_api_url_needs_opt_in() {
+        let e = Config::load(
+            None,
+            &[],
+            &env_of(&[("BYNH_API_URL", "http://api.example.com")]),
+        )
+        .unwrap_err();
+        assert!(e.0.contains("insecure_api_url"), "{e}");
+        let c = Config::load(
+            None,
+            &[],
+            &env_of(&[
+                ("BYNH_API_URL", "http://api.example.com"),
+                ("BYNH_INSECURE_API_URL", "true"),
+            ]),
+        )
+        .unwrap();
+        assert!(c.insecure_api_url && is_insecure_api_url(&c.api_url));
+        for local in [
+            "http://127.0.0.1:8080",
+            "http://localhost",
+            "http://[::1]:1",
+        ] {
+            assert!(
+                Config::load(None, &[], &env_of(&[("BYNH_API_URL", local)])).is_ok(),
+                "{local}"
+            );
+        }
+    }
+
+    #[test]
+    fn toml_errors_never_quote_the_file() {
+        let f = file("concurrency = 4\ntoken = \"bynh_agt_supersecret_value\" junk\n");
+        let e = Config::load(Some(f.path()), &[], &env_of(&[])).unwrap_err();
+        assert!(!e.0.contains("supersecret"), "{e}");
+        assert!(e.0.contains("line 2"), "{e}");
+    }
+
+    #[test]
+    fn deny_cidrs_from_file_and_env() {
+        let f = file("deny_cidrs = [\"10.0.0.0/8\", \"192.0.2.1\"]\n");
+        let c = Config::load(Some(f.path()), &[], &env_of(&[])).unwrap();
+        assert_eq!(c.deny_cidrs.len(), 2);
+        let c = Config::load(
+            Some(f.path()),
+            &[],
+            &env_of(&[("BYNH_DENY_CIDRS", "172.16.0.0/12, fd00::/8")]),
+        )
+        .unwrap();
+        assert_eq!(c.deny_cidrs.len(), 2);
+        assert!(c.deny_cidrs[1].contains("fd00::1".parse().unwrap()));
+        assert!(Config::load(None, &[], &env_of(&[("BYNH_DENY_CIDRS", "nope")])).is_err());
     }
 
     #[test]

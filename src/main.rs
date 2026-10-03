@@ -20,7 +20,7 @@ use bynh_status_agent::protocol::{Check, CheckType, IpVersion, AGENT_VERSION};
     about = "Uptime monitoring agent for bynh. Runs checks assigned by the platform and reports the results."
 )]
 struct Cli {
-    /// Config file (default: /etc/bynh-status-agent/bynh-status-agent.toml, then ./bynh-status-agent.toml).
+    /// Config file (default: /etc/bynh-status-agent/bynh-status-agent.toml).
     /// Optional: every setting can come from BYNH_* environment variables.
     #[arg(long, global = true, env = "BYNH_CONFIG", value_name = "PATH")]
     config: Option<PathBuf>,
@@ -120,6 +120,12 @@ fn main() -> ExitCode {
     if let Some(f) = cli.log_format {
         config.log_format = f;
     }
+    // The secrets now live in `config`; keep them out of the environment that
+    // child processes or crash tooling could see. Still single-threaded here.
+    for key in ["BYNH_TOKEN", "BYNH_PROXY_URL"] {
+        std::env::remove_var(key);
+    }
+    let fd_note = cap_concurrency_to_fd_limit(&mut config);
 
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -145,9 +151,65 @@ fn main() -> ExitCode {
         }
         _ => {
             init_logging(&config, false);
+            if let Some(note) = fd_note {
+                tracing::warn!("{note}");
+            }
             runtime.block_on(run(config))
         }
     }
+}
+
+/// File descriptors kept free for DNS, the platform connection and logging.
+const FD_RESERVE: u64 = 64;
+
+/// Raises the soft open-file limit towards the hard limit (up to 65,536) and
+/// lowers `concurrency` if the limit still can't cover it. Returns a note to
+/// log once logging is up.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // rlim_t is u32 on some 32-bit targets
+fn cap_concurrency_to_fd_limit(config: &mut Config) -> Option<String> {
+    const WANT: u64 = 65_536;
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit only writes into the struct we pass.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return None;
+    }
+    if lim.rlim_cur == libc::RLIM_INFINITY {
+        return None;
+    }
+    let target = if lim.rlim_max == libc::RLIM_INFINITY {
+        WANT
+    } else {
+        (lim.rlim_max as u64).min(WANT)
+    };
+    if (lim.rlim_cur as u64) < target {
+        let raised = libc::rlimit {
+            rlim_cur: target as libc::rlim_t,
+            rlim_max: lim.rlim_max,
+        };
+        // SAFETY: setrlimit reads the struct we pass; failure is harmless.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+            lim.rlim_cur = raised.rlim_cur;
+        }
+    }
+    let budget = (lim.rlim_cur as u64).saturating_sub(FD_RESERVE).max(1);
+    if (config.concurrency as u64) > budget {
+        let note = format!(
+            "concurrency {} exceeds the open-file limit ({}); using {budget}. Raise the limit (ulimit -n, LimitNOFILE) to run more checks at once.",
+            config.concurrency, lim.rlim_cur
+        );
+        config.concurrency = budget as usize;
+        return Some(note);
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn cap_concurrency_to_fd_limit(_config: &mut Config) -> Option<String> {
+    None
 }
 
 fn init_logging(config: &Config, to_stderr: bool) {
@@ -257,7 +319,11 @@ async fn check_once(config: Config, args: CheckArgs) -> ExitCode {
         }
     };
     let allow_private = config.allow_private || args.allow_private;
-    let mut prober = Prober::new(net, Guard::new(allow_private), true);
+    let mut prober = Prober::new(
+        net,
+        Guard::new(allow_private).with_deny(config.deny_cidrs.clone()),
+        true,
+    );
     if config.check_via_proxy && allow_private {
         prober = prober.with_proxy(config.proxy.clone());
     }
@@ -330,5 +396,5 @@ fn build_check(a: &CheckArgs) -> Result<Check, String> {
         "6" => IpVersion::V6,
         _ => IpVersion::Any,
     };
-    Ok(c)
+    c.validate().map_err(|e| format!("invalid check: {e}"))
 }

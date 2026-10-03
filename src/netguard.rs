@@ -11,6 +11,51 @@ use crate::protocol::{CheckError, ErrorKind};
 pub struct Guard {
     pub allow_private: bool,
     exempt: Vec<IpAddr>,
+    /// Operator deny list, enforced even with `allow_private`.
+    deny: Vec<Cidr>,
+}
+
+/// An IP network such as `10.0.0.0/8` or `fd00::/8`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cidr {
+    pub addr: IpAddr,
+    pub prefix: u8,
+}
+
+impl Cidr {
+    /// Parses `addr/prefix` or a bare address (a host route).
+    pub fn parse(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        let (addr, prefix) = match raw.split_once('/') {
+            Some((a, p)) => (a.parse::<IpAddr>().ok()?, Some(p.parse::<u8>().ok()?)),
+            None => (raw.parse::<IpAddr>().ok()?, None),
+        };
+        let max = if addr.is_ipv4() { 32 } else { 128 };
+        let prefix = prefix.unwrap_or(max);
+        (prefix <= max).then_some(Self { addr, prefix })
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (ip, self.addr) {
+            (IpAddr::V4(a), IpAddr::V4(n)) => {
+                let mask = u32::MAX
+                    .checked_shl(32 - u32::from(self.prefix))
+                    .unwrap_or(0);
+                u32::from(a) & mask == u32::from(n) & mask
+            }
+            (IpAddr::V6(a), IpAddr::V6(n)) => {
+                let mask = u128::MAX
+                    .checked_shl(128 - u32::from(self.prefix))
+                    .unwrap_or(0);
+                u128::from(a) & mask == u128::from(n) & mask
+            }
+            // An IPv4 network also covers the IPv4-mapped IPv6 form.
+            (IpAddr::V6(a), IpAddr::V4(_)) => a
+                .to_ipv4_mapped()
+                .is_some_and(|v4| self.contains(IpAddr::V4(v4))),
+            _ => false,
+        }
+    }
 }
 
 impl Guard {
@@ -18,7 +63,14 @@ impl Guard {
         Self {
             allow_private,
             exempt: Vec::new(),
+            deny: Vec::new(),
         }
+    }
+
+    /// Networks the agent must never contact, whatever `allow_private` says.
+    pub fn with_deny(mut self, deny: Vec<Cidr>) -> Self {
+        self.deny = deny;
+        self
     }
 
     /// Test hook: treat `ip` as public. Lets integration tests run targets on
@@ -30,6 +82,12 @@ impl Guard {
     }
 
     pub fn check(&self, ip: IpAddr) -> Result<(), CheckError> {
+        if self.deny.iter().any(|c| c.contains(ip)) {
+            return Err(CheckError::new(
+                ErrorKind::Blocked,
+                format!("refusing {ip}: it is in the agent's deny_cidrs"),
+            ));
+        }
         if self.allow_private || self.exempt.contains(&ip) {
             return Ok(());
         }
@@ -97,6 +155,15 @@ fn v4_reason(ip: Ipv4Addr) -> Option<&'static str> {
     if o[0] == 198 && (o[1] & 0xFE) == 18 {
         return Some("reserved"); // 198.18.0.0/15, benchmarking
     }
+    if (o[0], o[1], o[2]) == (192, 0, 2)
+        || (o[0], o[1], o[2]) == (198, 51, 100)
+        || (o[0], o[1], o[2]) == (203, 0, 113)
+    {
+        return Some("documentation"); // TEST-NET-1/2/3
+    }
+    if (o[0], o[1], o[2]) == (192, 88, 99) {
+        return Some("reserved"); // 192.88.99.0/24, deprecated 6to4 relay anycast
+    }
     None
 }
 
@@ -125,6 +192,18 @@ fn v6_reason(ip: Ipv6Addr) -> Option<&'static str> {
     if s[0] == 0x2002 {
         let v4 = Ipv4Addr::new((s[1] >> 8) as u8, s[1] as u8, (s[2] >> 8) as u8, s[2] as u8);
         return v4_reason(v4);
+    }
+    if s[0..3] == [0x64, 0xff9b, 1] {
+        return Some("reserved"); // 64:ff9b:1::/48, local-use NAT64
+    }
+    if s[0] == 0x2001 && s[1] == 0 {
+        return Some("reserved"); // 2001::/32, Teredo
+    }
+    if s[0] == 0x2001 && s[1] == 0x0db8 {
+        return Some("documentation"); // 2001:db8::/32
+    }
+    if (s[0] & 0xfff0) == 0x3ff0 {
+        return Some("documentation"); // 3fff::/20
     }
     if (s[0] & 0xfe00) == 0xfc00 {
         return Some("unique local"); // fc00::/7
@@ -174,6 +253,10 @@ mod tests {
             "192.0.0.8",
             "198.18.0.1",
             "198.19.255.255",
+            "192.0.2.1",
+            "198.51.100.7",
+            "203.0.113.5",
+            "192.88.99.1",
         ] {
             assert!(blocked(ip), "{ip} should be blocked");
         }
@@ -186,7 +269,8 @@ mod tests {
             "100.128.0.0",
             "192.0.1.1",
             "198.20.0.1",
-            "203.0.113.5",
+            "203.0.114.5",
+            "192.88.100.1",
             "9.9.9.9",
         ] {
             assert!(!blocked(ip), "{ip} should be allowed");
@@ -206,6 +290,12 @@ mod tests {
             "ff02::1",
             "fec0::1",
             "100::1",
+            "64:ff9b:1::1",
+            "2001::1",
+            "2001:0:4136:e378::1",
+            "2001:db8::1",
+            "3fff::1",
+            "3fff:fff::1",
         ] {
             assert!(blocked(ip), "{ip} should be blocked");
         }
@@ -213,6 +303,7 @@ mod tests {
             "2001:4860:4860::8888",
             "2606:4700:4700::1111",
             "2a01:4f8::1",
+            "4000::1",
         ] {
             assert!(!blocked(ip), "{ip} should be allowed");
         }
@@ -248,6 +339,28 @@ mod tests {
         assert!(Guard::new(true).check(ip).is_ok());
         assert!(Guard::new(false).with_test_exemption(ip).check(ip).is_ok());
         assert!(Guard::new(false).check("1.1.1.1".parse().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn deny_cidrs_apply_even_with_allow_private() {
+        let deny = vec![
+            Cidr::parse("10.1.0.0/16").unwrap(),
+            Cidr::parse("8.8.8.8").unwrap(),
+            Cidr::parse("2001:4860::/32").unwrap(),
+        ];
+        let g = Guard::new(true).with_deny(deny);
+        let blocked = |s: &str| g.check(s.parse().unwrap()).is_err();
+        assert!(blocked("10.1.2.3"));
+        assert!(!blocked("10.2.0.1"));
+        assert!(blocked("8.8.8.8"));
+        assert!(blocked("::ffff:8.8.8.8"));
+        assert!(blocked("2001:4860:4860::8888"));
+        assert!(!blocked("1.1.1.1"));
+        assert!(Cidr::parse("10.0.0.0/33").is_none());
+        assert!(Cidr::parse("nope").is_none());
+        assert!(Cidr::parse("0.0.0.0/0")
+            .unwrap()
+            .contains("9.9.9.9".parse().unwrap()));
     }
 
     #[test]

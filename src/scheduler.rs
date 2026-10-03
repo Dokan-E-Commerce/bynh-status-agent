@@ -37,6 +37,14 @@ pub fn fnv1a(s: &str) -> u64 {
     h
 }
 
+/// A check's interval in ms, clamped to 1 s – 24 h whatever the platform
+/// sent (so the timer arithmetic can't overflow or spin).
+pub fn interval_ms(interval_seconds: u64) -> u64 {
+    interval_seconds
+        .clamp(1, crate::protocol::limits::MAX_INTERVAL_SECONDS)
+        .saturating_mul(1000)
+}
+
 /// Offset of a check within its interval, in ms: `hash(id) mod interval`.
 pub fn stable_offset_ms(id: &str, interval_ms: u64) -> u64 {
     fnv1a(id) % interval_ms.max(1)
@@ -51,7 +59,7 @@ pub fn next_run_ms(now_ms: u64, interval_ms: u64, offset_ms: u64) -> u64 {
         return offset_ms;
     }
     let k = (now_ms - offset_ms).div_ceil(interval_ms);
-    offset_ms + k * interval_ms
+    offset_ms.saturating_add(k.saturating_mul(interval_ms))
 }
 
 fn unix_ms() -> u64 {
@@ -167,7 +175,8 @@ async fn run_timer<R: CheckRunner>(
     buffer: Arc<ResultBuffer>,
     permits: Arc<Semaphore>,
 ) {
-    let interval_ms = check.interval_seconds.max(1) * 1000;
+    let interval_ms = interval_ms(check.interval_seconds);
+    assert!(interval_ms > 0, "check interval must be positive");
     let interval = Duration::from_millis(interval_ms);
     let offset = stable_offset_ms(&check.id, interval_ms);
     let now = unix_ms();
@@ -219,6 +228,33 @@ mod tests {
             buckets[(o / 6_000) as usize] += 1;
         }
         assert!(buckets.iter().all(|&n| n > 50), "{buckets:?}");
+    }
+
+    #[test]
+    fn huge_intervals_are_clamped() {
+        let day = 86_400_000;
+        assert_eq!(interval_ms(u64::MAX), day);
+        assert_eq!(interval_ms(1 << 61), day);
+        assert_eq!(interval_ms(0), 1000);
+        let now = 1_759_467_600_123;
+        let t = next_run_ms(
+            now,
+            interval_ms(1 << 61),
+            stable_offset_ms("m", interval_ms(1 << 61)),
+        );
+        assert!(t >= now && t < now + day);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn huge_interval_check_does_not_spin() {
+        let runner = fake();
+        let buf = Arc::new(ResultBuffer::default());
+        let mut s = Scheduler::new(runner.clone(), buf, 2);
+        let mut c = check("big", 1);
+        c.interval_seconds = 1 << 61; // 2^61 × 1000 used to wrap to 0
+        s.apply(vec![c]);
+        tokio::time::sleep(Duration::from_secs(2 * 86_400)).await;
+        assert!(runner.calls.load(Ordering::SeqCst) <= 3);
     }
 
     #[test]

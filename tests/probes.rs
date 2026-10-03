@@ -401,3 +401,134 @@ async fn no_proxy_connects_directly() {
     assert_eq!(r.remote_ip.as_deref(), Some(LOOPBACK));
     assert!(log.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn cross_origin_redirect_drops_custom_headers() {
+    let a = spawn_target().await;
+    let b = spawn_target().await;
+    let p = prober(true);
+    let check = |to: String, kw: &str| {
+        let mut c = http(format!("http://{a}/to?to={to}"));
+        c.kind = CheckType::Keyword;
+        c.headers.insert("X-Probe".into(), "secret".into());
+        c.keyword = Some(kw.into());
+        c
+    };
+    assert!(p.run(&check("/echo".into(), "x-probe=secret")).await.ok);
+    let r = p.run(&check(format!("http://{b}/echo"), "x-probe=-")).await;
+    assert!(r.ok, "custom header leaked across origins: {r:?}");
+}
+
+#[tokio::test]
+async fn redirect_userinfo_is_stripped() {
+    let (proxy, log) = common::spawn_proxy(None).await;
+    let a = spawn_target().await;
+    let b = spawn_target().await;
+    let mut c = http(format!(
+        "http://{a}/to?to=http://user:pw-secret@127.0.0.1:{}/echo-auth",
+        b.port()
+    ));
+    c.kind = CheckType::Keyword;
+    c.keyword = Some("auth=none".into());
+    let r = proxied(&format!("http://{proxy}")).run(&c).await;
+    assert!(r.ok, "{r:?}");
+    let log = log.lock().unwrap().clone();
+    // log[0] is our own request (the payload sits in its query string).
+    let hop = log
+        .iter()
+        .find(|l| {
+            l.starts_with("GET http://127.0.0.1")
+                && l.contains(" HTTP/1.1")
+                && l.contains(&format!(":{}/echo-auth", b.port()))
+                && !l.contains("/to?")
+        })
+        .expect("redirected request");
+    assert!(!hop.contains("pw-secret") && !hop.contains('@'), "{hop}");
+}
+
+#[tokio::test]
+async fn framing_headers_from_monitors_are_ignored() {
+    let t = spawn_target().await;
+    let mut c = http(format!("http://{t}/echo"));
+    c.kind = CheckType::Keyword;
+    for (k, v) in [
+        ("Content-Length", "999"),
+        ("Transfer-Encoding", "chunked"),
+        ("Host", "evil.example"),
+        ("Connection", "upgrade"),
+        ("Upgrade", "websocket"),
+        ("Expect", "100-continue"),
+        ("Proxy-Authorization", "Basic eA=="),
+        ("X-Probe", "1"),
+    ] {
+        c.headers.insert(k.into(), v.into());
+    }
+    c.keyword = Some("method=GET body= x-probe=1".into());
+    let r = prober(true).run(&c).await;
+    assert!(r.ok, "{r:?}");
+}
+
+#[tokio::test]
+async fn non_ascii_location_is_followed() {
+    let t = spawn_target().await;
+    let r = prober(true)
+        .run(&http(format!("http://{t}/to-nonascii")))
+        .await;
+    assert!(r.ok, "{r:?}");
+    assert_eq!(r.status_code, Some(200));
+}
+
+#[tokio::test]
+async fn status_code_is_reset_per_hop() {
+    let t = spawn_target().await;
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let mut c = http(format!("http://{t}/to?to=http://{closed}/"));
+    c.timeout_ms = 10_000;
+    let r = prober(true).run(&c).await;
+    assert_eq!(r.error.unwrap().kind, ErrorKind::Connect);
+    assert_eq!(
+        r.status_code, None,
+        "302 from the first hop must not be reported"
+    );
+    assert_eq!(r.response_bytes, None);
+}
+
+#[tokio::test]
+async fn crlf_in_host_never_reaches_the_proxy() {
+    let (proxy, log) = common::spawn_proxy(None).await;
+    let p = proxied(&format!("http://{proxy}"));
+    for kind in [CheckType::Tcp, CheckType::Tls] {
+        let mut c = Check::new("mon_x", kind);
+        // Constructed directly, bypassing assignment validation.
+        c.host = Some("evil.com:443 HTTP/1.1\r\nHost: x\r\n\r\nGET /admin HTTP/1.1\r\nX:".into());
+        c.port = Some(443);
+        let r = p.run(&c).await;
+        assert!(!r.ok);
+        assert_eq!(r.error.unwrap().message, "invalid host");
+    }
+    assert!(log.lock().unwrap().is_empty(), "the proxy was contacted");
+}
+
+#[tokio::test]
+async fn deny_cidrs_block_even_with_allow_private() {
+    let t = spawn_target().await;
+    let deny = vec![bynh_status_agent::netguard::Cidr::parse("127.0.0.0/8").unwrap()];
+    let p = Prober::new(
+        Arc::new(Net::new(None).unwrap()),
+        Guard::new(true).with_deny(deny),
+        true,
+    );
+    let r = p.run(&http(format!("http://{t}/ok"))).await;
+    assert_eq!(r.error.unwrap().kind, ErrorKind::Blocked);
+}
+
+#[tokio::test]
+async fn http_checks_count_without_buffering() {
+    let t = spawn_target().await;
+    let r = prober(true).run(&http(format!("http://{t}/big"))).await;
+    assert!(r.ok);
+    assert_eq!(r.response_bytes, Some(1 << 20));
+}

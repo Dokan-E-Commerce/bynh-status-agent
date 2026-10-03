@@ -53,6 +53,25 @@ pub fn redirect_method(status: u16, method: &Method) -> (Method, bool) {
     }
 }
 
+/// Headers kept when a redirect leaves the original origin. Everything else
+/// configured on the monitor (credentials, API keys under any name) stays
+/// with the origin it was meant for.
+pub fn cross_origin_headers(headers: &http::HeaderMap, body_kept: bool) -> http::HeaderMap {
+    use http::header;
+    let mut out = http::HeaderMap::new();
+    for (name, value) in headers {
+        let keep = *name == header::USER_AGENT
+            || *name == header::ACCEPT
+            || *name == header::ACCEPT_LANGUAGE
+            || *name == header::ACCEPT_ENCODING
+            || (body_kept && *name == header::CONTENT_TYPE);
+        if keep {
+            out.append(name.clone(), value.clone());
+        }
+    }
+    out
+}
+
 /// Credentials are only sent to the origin they were configured for.
 pub fn crosses_origin(from: &url::Url, to: &url::Url) -> bool {
     from.origin() != to.origin()
@@ -127,6 +146,28 @@ mod tests {
             (Method::DELETE, true)
         );
         assert!(is_redirect(308) && !is_redirect(304) && !is_redirect(300));
+    }
+
+    #[test]
+    fn cross_origin_keeps_only_safe_headers() {
+        let mut h = http::HeaderMap::new();
+        for (k, v) in [
+            ("authorization", "Bearer t"),
+            ("cookie", "c=1"),
+            ("x-api-key", "secret"),
+            ("user-agent", "ua"),
+            ("accept", "*/*"),
+            ("accept-language", "ar"),
+            ("content-type", "application/json"),
+        ] {
+            h.insert(http::HeaderName::from_static(k), v.parse().unwrap());
+        }
+        let kept = cross_origin_headers(&h, false);
+        let names: Vec<_> = kept.keys().map(|k| k.as_str()).collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert!(kept.contains_key("user-agent") && kept.contains_key("accept-language"));
+        assert!(!kept.contains_key("x-api-key") && !kept.contains_key("authorization"));
+        assert!(cross_origin_headers(&h, true).contains_key("content-type"));
     }
 
     #[test]

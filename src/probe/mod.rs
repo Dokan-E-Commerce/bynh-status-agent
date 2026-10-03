@@ -18,6 +18,9 @@ use crate::proxy::{ProxyEndpoint, ProxySettings};
 
 /// Maximum number of response body bytes read per request.
 pub const MAX_BODY: usize = 1 << 20;
+/// Time allowed for the second handshake that reads an untrusted
+/// certificate's expiry.
+const TLS_FALLBACK_TIMEOUT: Duration = Duration::from_secs(2);
 /// Upper bound on a check's timeout, whatever the platform sends.
 pub const MAX_TIMEOUT_MS: u64 = 120_000;
 
@@ -134,9 +137,20 @@ impl Prober {
         let _ = url.set_username("");
         let _ = url.set_password(None);
 
-        let mut method = Method::from_bytes(check.method.trim().to_ascii_uppercase().as_bytes())
-            .map_err(|_| other("invalid method"))?;
+        let upper = check.method.trim().to_ascii_uppercase();
+        if !crate::protocol::METHODS.contains(&upper.as_str()) {
+            return Err(other("method not allowed"));
+        }
+        let mut method =
+            Method::from_bytes(upper.as_bytes()).map_err(|_| other("invalid method"))?;
         let mut headers = build_headers(check)?;
+        if check.kind == CheckType::Keyword {
+            // The keyword is matched against the raw bytes, so ask for them.
+            headers.insert(
+                header::ACCEPT_ENCODING,
+                HeaderValue::from_static("identity"),
+            );
+        }
         if let Some(a) = &auth {
             headers.insert(header::AUTHORIZATION, auth_header(a)?);
         }
@@ -155,6 +169,8 @@ impl Prober {
         let mut hops = 0u32;
         loop {
             out.trace = Trace::default();
+            out.status_code = None;
+            out.response_bytes = None;
             let resp = self
                 .net
                 .http(
@@ -168,12 +184,13 @@ impl Prober {
                         guard: &self.guard,
                         proxy: self.proxy.as_deref().and_then(|p| p.for_url(&url)),
                         max_body: MAX_BODY,
+                        keep_body: keyword.is_some(),
                     },
                     &mut out.trace,
                 )
                 .await?;
             out.status_code = Some(resp.status);
-            out.response_bytes = Some(resp.body.len() as u64);
+            out.response_bytes = Some(resp.body_len);
 
             if check.follow_redirects && rules::is_redirect(resp.status) {
                 if let Some(location) = resp.headers.get(header::LOCATION) {
@@ -183,10 +200,10 @@ impl Prober {
                             format!("more than {} redirects", check.max_redirects),
                         ));
                     }
-                    let location = location.to_str().map_err(|_| {
-                        CheckError::new(ErrorKind::Redirects, "invalid Location header")
-                    })?;
-                    let next = url.join(location).map_err(|e| {
+                    // Non-ASCII bytes are tolerated; the URL parser
+                    // percent-encodes them.
+                    let location = String::from_utf8_lossy(location.as_bytes());
+                    let mut next = url.join(location.trim()).map_err(|e| {
                         CheckError::new(
                             ErrorKind::Redirects,
                             format!("invalid redirect target: {e}"),
@@ -198,15 +215,17 @@ impl Prober {
                             format!("redirect to unsupported scheme {:?}", next.scheme()),
                         ));
                     }
-                    if rules::crosses_origin(&url, &next) {
-                        headers.remove(header::AUTHORIZATION);
-                        headers.remove(header::PROXY_AUTHORIZATION);
-                        headers.remove(header::COOKIE);
-                    }
+                    // Credentials in a Location are never followed or passed on
+                    // (they would reach a proxy in absolute-form requests).
+                    let _ = next.set_username("");
+                    let _ = next.set_password(None);
                     let (m, keep_body) = rules::redirect_method(resp.status, &method);
                     if !keep_body {
                         body = None;
                         headers.remove(header::CONTENT_TYPE);
+                    }
+                    if rules::crosses_origin(&url, &next) {
+                        headers = rules::cross_origin_headers(&headers, keep_body);
                     }
                     method = m;
                     url = next;
@@ -278,27 +297,27 @@ impl Prober {
             if check.verify_tls {
                 // Learn the expiry anyway, so an expired or untrusted certificate
                 // still reports when it expires.
+                // Bounded separately so it can't turn a TLS error into a timeout.
                 let mut probe = Trace::default();
-                if let Ok(tcp) = self
-                    .net
-                    .connect_target(
-                        &host,
-                        port,
-                        check.ip_version,
-                        &self.guard,
-                        proxy,
-                        &mut probe,
-                    )
-                    .await
-                {
-                    if self
+                let fallback = async {
+                    let tcp = self
                         .net
+                        .connect_target(
+                            &host,
+                            port,
+                            check.ip_version,
+                            &self.guard,
+                            proxy,
+                            &mut probe,
+                        )
+                        .await?;
+                    self.net
                         .tls_handshake(tcp, &host, false, &mut probe)
-                        .await
-                        .is_ok()
-                    {
-                        out.trace.tls_expires_at = probe.tls_expires_at;
-                    }
+                        .await?;
+                    Ok::<_, CheckError>(())
+                };
+                if let Ok(Ok(())) = tokio::time::timeout(TLS_FALLBACK_TIMEOUT, fallback).await {
+                    out.trace.tls_expires_at = probe.tls_expires_at;
                 }
             }
             return Err(e);
@@ -320,10 +339,7 @@ impl Prober {
 /// Target of a tcp/tls check: `host` + `port`, or the host and port of `url`.
 fn host_port(check: &Check, default_port: Option<u16>) -> Result<(String, u16), CheckError> {
     if let Some(host) = check.host.as_deref().filter(|h| !h.is_empty()) {
-        let host = host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .to_owned();
+        let host = net::normalize_host(host)?;
         let port = check
             .port
             .or(default_port)
@@ -343,13 +359,34 @@ fn host_port(check: &Check, default_port: Option<u16>) -> Result<(String, u16), 
     Err(other("check has no host"))
 }
 
+/// Headers a monitor may not set: they control framing or the connection
+/// and could desynchronise the request.
+fn is_forbidden_header(name: &HeaderName) -> bool {
+    let n = name.as_str();
+    matches!(
+        n,
+        "content-length"
+            | "transfer-encoding"
+            | "te"
+            | "upgrade"
+            | "expect"
+            | "keep-alive"
+            | "connection"
+            | "host"
+            | "trailer"
+    ) || n.starts_with("proxy-")
+}
+
 fn build_headers(check: &Check) -> Result<HeaderMap, CheckError> {
     let mut map = HeaderMap::new();
     for (k, v) in &check.headers {
         let name = HeaderName::from_bytes(k.trim().as_bytes())
-            .map_err(|_| other(format!("invalid header name {k:?}")))?;
-        let value = HeaderValue::from_str(v)
-            .map_err(|_| other(format!("invalid value for header {name}")))?;
+            .map_err(|_| other("invalid header name"))?;
+        if is_forbidden_header(&name) {
+            continue;
+        }
+        let mut value = HeaderValue::from_str(v).map_err(|_| other("invalid header value"))?;
+        value.set_sensitive(true);
         map.append(name, value);
     }
     Ok(map)

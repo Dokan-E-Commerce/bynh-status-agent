@@ -14,12 +14,13 @@ use crate::net::{HttpRequest, Net, Trace};
 use crate::netguard::Guard;
 use crate::protocol::{
     user_agent, Assignments, CheckResult, HelloRequest, HelloResponse, IpVersion, ResultsRequest,
-    ResultsResponse, UpgradeRequired, PROTOCOL_VERSION,
+    ResultsResponse, UpgradeRequired, PATH_ASSIGNMENTS, PATH_HELLO, PATH_RESULTS, PROTOCOL_HEADER,
+    PROTOCOL_VERSION,
 };
 use crate::proxy::ProxySettings;
 
-/// Largest platform response we accept (compressed or not).
-const MAX_RESPONSE: usize = 32 << 20;
+/// Largest platform response we accept, compressed and after decompression.
+pub const MAX_RESPONSE: usize = 8 << 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiError {
@@ -104,7 +105,7 @@ impl PlatformClient {
     pub async fn hello(&self, req: &HelloRequest) -> Result<HelloResponse, ApiError> {
         let body = serde_json::to_vec(req).map_err(|e| decode_err(e.to_string()))?;
         let resp = self
-            .send(Method::POST, "/api/v1/agent/hello", Some(body), false, None)
+            .send(Method::POST, PATH_HELLO, Some(body), false, None)
             .await?;
         expect(&resp, &[200])?;
         serde_json::from_slice(&resp.body).map_err(|e| decode_err(format!("hello response: {e}")))
@@ -112,7 +113,7 @@ impl PlatformClient {
 
     pub async fn assignments(&self, etag: Option<&str>) -> Result<AssignmentsOutcome, ApiError> {
         let resp = self
-            .send(Method::GET, "/api/v1/agent/assignments", None, false, etag)
+            .send(Method::GET, PATH_ASSIGNMENTS, None, false, etag)
             .await?;
         if resp.status == 304 {
             return Ok(AssignmentsOutcome::NotModified);
@@ -133,13 +134,7 @@ impl PlatformClient {
         let body = serde_json::to_vec(&ResultsRequest { results })
             .map_err(|e| decode_err(e.to_string()))?;
         let resp = self
-            .send(
-                Method::POST,
-                "/api/v1/agent/results",
-                Some(body),
-                true,
-                None,
-            )
+            .send(Method::POST, PATH_RESULTS, Some(body), true, None)
             .await?;
         expect(&resp, &[200, 202])?;
         Ok(serde_json::from_slice(&resp.body).unwrap_or_default())
@@ -168,7 +163,7 @@ impl PlatformClient {
             HeaderValue::from_str(&user_agent()).expect("ascii user agent"),
         );
         headers.insert(
-            "x-bynh-status-agent-protocol",
+            http::HeaderName::from_bytes(PROTOCOL_HEADER.as_bytes()).expect("valid header name"),
             HeaderValue::from_static(PROTOCOL_VERSION),
         );
         headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
@@ -206,6 +201,7 @@ impl PlatformClient {
                 guard: &self.guard,
                 proxy: self.proxy.for_url(&url),
                 max_body: MAX_RESPONSE,
+                keep_body: true,
             },
             &mut trace,
         );
@@ -343,6 +339,15 @@ mod tests {
         let past = httpdate::fmt_http_date(now - Duration::from_secs(30));
         assert_eq!(parse_retry_after(&past, now), Some(Duration::ZERO));
         assert_eq!(parse_retry_after("soon", now), None);
+    }
+
+    #[test]
+    fn gzip_bomb_is_refused() {
+        assert_eq!(MAX_RESPONSE, 8 << 20);
+        let bomb = gzip_bytes(&vec![b' '; MAX_RESPONSE + 1]);
+        assert!(bomb.len() < 64 * 1024);
+        assert!(gunzip(&bomb).is_err());
+        assert!(gunzip(&gzip_bytes(&vec![b' '; MAX_RESPONSE])).is_ok());
     }
 
     #[test]

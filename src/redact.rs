@@ -28,8 +28,23 @@ pub fn url_for_log(raw: &str) -> String {
     }
 }
 
-/// Renders headers for debug logs with sensitive values replaced.
+/// Renders header names for trace logs. Values are never shown: monitor
+/// headers can hold API keys under any name.
 pub fn headers_for_log(headers: &HeaderMap) -> String {
+    let mut out = String::new();
+    for name in headers.keys() {
+        if !out.is_empty() {
+            out.push_str(", ");
+        }
+        out.push_str(name.as_str());
+        out.push_str(": <redacted>");
+    }
+    out
+}
+
+/// Renders headers with only well-known sensitive values replaced. Kept for
+/// headers the agent sets itself.
+pub fn platform_headers_for_log(headers: &HeaderMap) -> String {
     let mut out = String::new();
     for (name, value) in headers {
         if !out.is_empty() {
@@ -55,9 +70,13 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("authorization", "Bearer bynh_agt_x_secret".parse().unwrap());
         h.insert("x-probe", "1".parse().unwrap());
-        let s = headers_for_log(&h);
+        let s = platform_headers_for_log(&h);
         assert!(!s.contains("secret"));
         assert!(s.contains("x-probe: 1"));
+        h.insert("x-custom-key", "hunter2".parse().unwrap());
+        let s = headers_for_log(&h);
+        assert!(!s.contains("hunter2") && !s.contains(": 1"), "{s}");
+        assert!(s.contains("x-custom-key: <redacted>"));
     }
 
     #[test]

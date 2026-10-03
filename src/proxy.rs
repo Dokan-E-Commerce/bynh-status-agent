@@ -109,7 +109,7 @@ enum Rule {
     /// Matches the domain and its subdomains (`example.com`, `.example.com`).
     Domain(String),
     Ip(IpAddr),
-    Cidr(IpAddr, u8),
+    Cidr(crate::netguard::Cidr),
 }
 
 /// Hosts that bypass the proxy.
@@ -133,12 +133,9 @@ impl NoProxy {
                 np.all = true;
                 continue;
             }
-            if let Some((ip, bits)) = item.split_once('/') {
-                if let (Ok(ip), Ok(bits)) = (ip.parse::<IpAddr>(), bits.parse::<u8>()) {
-                    let max = if ip.is_ipv4() { 32 } else { 128 };
-                    if bits <= max {
-                        np.rules.push(Rule::Cidr(ip, bits));
-                    }
+            if item.contains('/') {
+                if let Some(c) = crate::netguard::Cidr::parse(item) {
+                    np.rules.push(Rule::Cidr(c));
                 }
                 continue;
             }
@@ -171,35 +168,13 @@ impl NoProxy {
         self.rules.iter().any(|r| match (r, ip) {
             (Rule::Domain(d), None) => host == *d || host.ends_with(&format!(".{d}")),
             (Rule::Ip(a), Some(ip)) => *a == ip,
-            (Rule::Cidr(net, bits), Some(ip)) => in_cidr(ip, *net, *bits),
+            (Rule::Cidr(c), Some(ip)) => c.contains(ip),
             _ => false,
         })
     }
 
     pub fn is_empty(&self) -> bool {
         !self.all && self.rules.is_empty()
-    }
-}
-
-fn in_cidr(ip: IpAddr, net: IpAddr, bits: u8) -> bool {
-    match (ip, net) {
-        (IpAddr::V4(a), IpAddr::V4(n)) => {
-            let mask = if bits == 0 {
-                0
-            } else {
-                u32::MAX << (32 - bits)
-            };
-            u32::from(a) & mask == u32::from(n) & mask
-        }
-        (IpAddr::V6(a), IpAddr::V6(n)) => {
-            let mask = if bits == 0 {
-                0
-            } else {
-                u128::MAX << (128 - bits)
-            };
-            u128::from(a) & mask == u128::from(n) & mask
-        }
-        _ => false,
     }
 }
 

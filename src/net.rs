@@ -60,13 +60,19 @@ pub struct HttpRequest<'a> {
     pub proxy: Option<&'a ProxyEndpoint>,
     /// Read at most this many body bytes; the rest is discarded unread.
     pub max_body: usize,
+    /// Keep the body in memory (keyword checks, platform responses). When
+    /// false the bytes are only counted.
+    pub keep_body: bool,
 }
 
 #[derive(Debug)]
 pub struct HttpResponse {
     pub status: u16,
     pub headers: HeaderMap,
+    /// The body, if `keep_body` was set (at most `max_body` bytes).
     pub body: Bytes,
+    /// Body bytes read (at most `max_body`), whether kept or not.
+    pub body_len: u64,
 }
 
 pub(crate) fn ms(d: Duration) -> u64 {
@@ -175,12 +181,8 @@ impl Net {
         match proxy {
             None => self.connect(host, port, ipv, guard, trace).await,
             Some(p) => {
+                let auth = connect_authority(host, port)?;
                 let mut tcp = self.connect_proxy(p, guard, trace).await?;
-                let auth = if host.contains(':') {
-                    format!("[{host}]:{port}")
-                } else {
-                    format!("{host}:{port}")
-                };
                 tunnel(&mut tcp, &auth, p, trace).await?;
                 Ok(tcp)
             }
@@ -243,9 +245,10 @@ impl Net {
         let mut absolute_form = false;
         let tcp = match req.proxy {
             Some(p) => {
+                let auth = connect_authority(&host, port)?;
                 let mut tcp = self.connect_proxy(p, req.guard, trace).await?;
                 if https {
-                    tunnel(&mut tcp, &authority(url, port), p, trace).await?;
+                    tunnel(&mut tcp, &auth, p, trace).await?;
                 } else {
                     absolute_form = true;
                 }
@@ -313,11 +316,51 @@ impl Net {
             let tls = self
                 .tls_handshake(tcp, &host, req.verify_tls, trace)
                 .await?;
-            exchange(tls, request, req.max_body, is_head, trace).await
+            exchange(tls, request, req.max_body, req.keep_body, is_head, trace).await
         } else {
-            exchange(tcp, request, req.max_body, is_head, trace).await
+            exchange(tcp, request, req.max_body, req.keep_body, is_head, trace).await
         }
     }
+}
+
+/// Validates a host from the platform: an IP literal (brackets optional for
+/// IPv6) or a DNS name made of letters, digits, `-`, `_` and `.`. Returns
+/// the normalised form (lowercase, no brackets). Anything else, including
+/// whitespace or CR/LF that could smuggle bytes into a request line, is
+/// refused.
+pub fn normalize_host(raw: &str) -> Result<String, CheckError> {
+    let invalid = || CheckError::new(ErrorKind::Other, "invalid host");
+    let h = raw.trim();
+    let h = match h.strip_prefix('[') {
+        Some(inner) => inner.strip_suffix(']').ok_or_else(invalid)?,
+        None => h,
+    };
+    if h.is_empty() || h.len() > crate::protocol::limits::MAX_HOST {
+        return Err(invalid());
+    }
+    if let Ok(ip) = h.parse::<IpAddr>() {
+        return Ok(ip.to_string());
+    }
+    match url::Host::parse(h) {
+        Ok(url::Host::Domain(d))
+            if d.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')) =>
+        {
+            Ok(d)
+        }
+        Ok(url::Host::Ipv4(ip)) => Ok(ip.to_string()),
+        _ => Err(invalid()),
+    }
+}
+
+/// `host:port` for a CONNECT line, built from a validated host.
+fn connect_authority(host: &str, port: u16) -> Result<String, CheckError> {
+    let host = normalize_host(host)?;
+    Ok(if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    })
 }
 
 /// Host of a URL without IPv6 brackets.
@@ -328,11 +371,6 @@ pub fn host_of(url: &url::Url) -> Result<String, CheckError> {
         Some(url::Host::Ipv6(ip)) => Ok(ip.to_string()),
         None => Err(CheckError::new(ErrorKind::Other, "URL has no host")),
     }
-}
-
-/// `host:port` for CONNECT, with IPv6 brackets.
-fn authority(url: &url::Url, port: u16) -> String {
-    format!("{}:{port}", url.host_str().unwrap_or_default())
 }
 
 /// Largest CONNECT response header we accept from a proxy.
@@ -347,6 +385,15 @@ async fn tunnel(
     trace: &mut Trace,
 ) -> Result<(), CheckError> {
     let conn_err = |m: String| CheckError::new(ErrorKind::Connect, format!("proxy {proxy}: {m}"));
+    // Defence in depth: the authority comes from a validated host, but never
+    // let anything that could end the request line through.
+    if authority.is_empty()
+        || authority
+            .bytes()
+            .any(|b| b.is_ascii_control() || b == b' ' || b == b'@' || b == b'/')
+    {
+        return Err(CheckError::new(ErrorKind::Other, "invalid host"));
+    }
     let start = Instant::now();
     let mut req = format!(
         "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: {}\r\n",
@@ -427,6 +474,7 @@ async fn exchange<S>(
     io: S,
     request: Request<Full<Bytes>>,
     max_body: usize,
+    keep_body: bool,
     is_head: bool,
     trace: &mut Trace,
 ) -> Result<HttpResponse, CheckError>
@@ -446,8 +494,9 @@ where
     trace.timings.ttfb_ms = Some(ms(start.elapsed()));
     let (parts, mut body) = response.into_parts();
     let mut buf = BytesMut::new();
+    let mut read = 0usize;
     if !is_head {
-        while buf.len() < max_body {
+        while read < max_body {
             match body.frame().await {
                 None => break,
                 Some(Err(e)) => {
@@ -458,8 +507,11 @@ where
                 }
                 Some(Ok(frame)) => {
                     if let Ok(data) = frame.into_data() {
-                        let room = max_body - buf.len();
-                        buf.extend_from_slice(&data[..data.len().min(room)]);
+                        let take = data.len().min(max_body - read);
+                        if keep_body {
+                            buf.extend_from_slice(&data[..take]);
+                        }
+                        read += take;
                     }
                 }
             }
@@ -469,6 +521,7 @@ where
         status: parts.status.as_u16(),
         headers: parts.headers,
         body: buf.freeze(),
+        body_len: read as u64,
     })
 }
 

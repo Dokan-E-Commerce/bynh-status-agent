@@ -102,7 +102,7 @@ impl Agent {
         let net = Arc::new(Net::new(config.ca_file.as_deref())?);
         let mut prober = Prober::new(
             net.clone(),
-            Guard::new(config.allow_private),
+            Guard::new(config.allow_private).with_deny(config.deny_cidrs.clone()),
             config.report_ip,
         );
         if config.check_via_proxy {
@@ -150,6 +150,13 @@ impl Agent {
             "bynh-status-agent starting"
         );
 
+        if crate::config::is_insecure_api_url(&self.config.api_url) {
+            tracing::warn!(
+                api_url = %self.config.api_url,
+                "INSECURE: api_url uses plain http (insecure_api_url = true). The agent token and \
+                 all results travel unencrypted and can be read or altered on the network."
+            );
+        }
         let mut backoff = Backoff::new(self.tun.backoff_base, self.tun.backoff_cap);
         let mut wait: Option<Duration> = None;
         loop {
@@ -337,7 +344,18 @@ impl Agent {
             }
             AssignmentsOutcome::Changed { assignments, etag } => {
                 for (id, reason) in &assignments.skipped {
-                    tracing::warn!(check_id = id.as_deref().unwrap_or("?"), %reason, "skipping a check this agent does not understand");
+                    tracing::warn!(
+                        check_id = id.as_deref().unwrap_or("?"),
+                        reason = *reason,
+                        "skipping a check this agent can't run"
+                    );
+                }
+                if assignments.truncated > 0 {
+                    tracing::warn!(
+                        ignored = assignments.truncated,
+                        limit = crate::protocol::limits::MAX_CHECKS,
+                        "too many checks assigned; ignoring the rest"
+                    );
                 }
                 let version = assignments.config_version.clone();
                 let stats = self.scheduler.apply(assignments.checks);
