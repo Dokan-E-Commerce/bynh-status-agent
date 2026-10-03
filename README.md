@@ -296,12 +296,14 @@ no_proxy = "localhost, .corp.internal, 10.0.0.0/8"
 
 ```text
 bynh-status-agent [--config PATH] [--log-format human|json] [run]   run the agent (the default)
-bynh-status-agent check <target> [options]                           run one check locally, print JSON
+bynh-status-agent check <target> [options]                           run one check locally, print JSON with details
 bynh-status-agent version                                            print version and protocol
 ```
 
-`check` is for debugging a monitor from the agent’s point of view. It sends nothing to bynh and exits
-with status 0 if the check passed, 1 if it failed:
+`check` is for debugging a monitor from the agent’s point of view. It prints the result exactly as the
+agent would report it, check details included (response headers, a body sample, redirects, TLS
+details and timings), sends nothing to bynh, and exits with status 0 if the check passed, 1 if it
+failed. `--no-body` leaves the body sample out, like a monitor with body capture off:
 
 ```sh
 bynh-status-agent check https://shop.example.com/health --expect 2xx
@@ -309,6 +311,7 @@ bynh-status-agent check https://shop.example.com --keyword "Add to cart"
 bynh-status-agent check --type tcp db.internal:5432 --allow-private
 bynh-status-agent check --type tls example.com
 bynh-status-agent check -X POST -H 'Content-Type: application/json' --body '{}' https://api.example.com/ping
+bynh-status-agent check https://shop.example.com/account --no-body
 ```
 
 Run `bynh-status-agent check --help` for every option.
@@ -322,10 +325,46 @@ Only what the protocol defines, to the `api_url` you configure:
 - **Assignment polls**: no body.
 - **Check results**: check id, start time, duration, pass or fail, status code, error kind and a short
   message, phase timings, certificate expiry, bytes read, and the IP connected to (unless
-  `report_ip = false`).
+  `report_ip = false`), plus the **check details** below.
 
-Response bodies, headers, and the credentials configured on your monitors are never sent anywhere
-other than the monitored target. There is no telemetry, no crash reporting and no other destination.
+### Check details
+
+Since 1.1.0 every result carries details, so you can see why a check failed without reproducing it
+(the exact format is in [PROTOCOL.md](PROTOCOL.md#check-details-agent-110)):
+
+- **Request**: the method and the URL as configured on the monitor (user info removed).
+- **Response**: HTTP version, status text, IP family (IPv4 or IPv6) and the response headers, in
+  order (at most 100, values cut to 2 KiB, 32 KiB in all), with sensitive values redacted (below).
+- **Body sample**: the first 64 KiB of the response body as text, or base64 for binary content,
+  with the body size, its SHA-256 and the content type. The agent still reads at most 1 MiB and keeps
+  only the sample.
+- **Redirects**: each hop followed, with where it pointed, its status, its duration and the IP it
+  came from (left out with `report_ip = false`).
+- **TLS**: protocol, cipher, certificate subject, issuer, names (SANs), validity dates, SHA-256
+  fingerprint, chain length, and whether the chain verified (with the reason if not). Checks with
+  `verify_tls` off still pass, but the details say whether the certificate would have verified.
+- **Timings**: DNS, connect, TLS, time to first byte, download, and total.
+
+A failed check includes everything gathered up to the failing phase: a status or keyword failure
+always has the headers and the body sample, a timeout during the body has what arrived so far, and a
+certificate that fails verification is still described. Each result stays under 128 KiB: the body
+sample is shortened first, then headers are dropped.
+
+**Body capture.** Body samples are on by default. Turn them off per monitor in bynh (the
+assignment field `capture_body: false`) for pages that show personal or confidential data: the agent
+then sends the size, hash and content type of the body, never its content. Keyword checks keep
+working, since matching happens on the agent.
+
+**Redaction.** Before a result leaves the agent, the values of these response headers are replaced
+with `[redacted]` (the name stays, so you can see the header was there): `set-cookie`,
+`authorization`, `proxy-authorization`, `cookie`, `www-authenticate`, and any header whose name
+contains `token`, `secret`, `key`, `session`, `auth`, `password` or `signature`, in any letter case.
+`content-security-policy`, `strict-transport-security`, `x-content-type-options`, `keep-alive` and
+`accept-ranges` are exempt. bynh redacts again on its side. Request headers and the credentials
+configured on your monitors are never part of the details.
+
+The credentials configured on your monitors are never sent anywhere other than the monitored target.
+There is no telemetry, no crash reporting and no other destination.
 
 ## Security model
 
@@ -441,6 +480,12 @@ machines you run them on, so allow those instead.
 
 Measured with 300 assigned checks (one-minute interval) on Linux, in the container image: about
 3 MiB resident memory and no measurable CPU between checks. The release binary is about 4 MB.
+
+Memory stays bounded however many checks fail or how long bynh is unreachable: each check in flight
+keeps at most a 64 KiB body sample (keyword checks hold the 1 MiB they search), and unsent results
+are buffered up to 10,000 results and 64 MiB. Over that budget the agent first drops the body samples
+of the oldest buffered results, then the oldest results themselves, and logs how many it dropped.
+Result batches are capped at 8 MiB.
 
 ## Building from source
 

@@ -6,6 +6,35 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.1.0] – not yet released
+
+### Added
+
+- Check details on every result (protocol v1, additive; see “Check details” in `PROTOCOL.md`): HTTP
+  version, IP family, the configured request method and URL, status text, ordered response headers,
+  a body sample (first 64 KiB, base64 for binary content) with size, SHA-256 and content type,
+  redirect hops (target, status, duration, address), TLS details (protocol, cipher, subject, issuer,
+  SANs, validity, SHA-256 fingerprint, chain length, verification result and reason) and
+  `download_ms`/`total_ms` timings. Failures include everything gathered up to the failing phase.
+- The assignment field `capture_body` (default `true`) turns the body sample off per monitor.
+- `bynh-status-agent check` prints the details; `--no-body` leaves the body sample out.
+
+### Security
+
+- Response header values that can carry credentials (`set-cookie`, `authorization`, `cookie`,
+  `www-authenticate`, and names containing `token`, `secret`, `key`, `session`, `auth`, `password`
+  or `signature`) are redacted on the agent. Request headers and monitor credentials are never part
+  of the details.
+
+### Changed
+
+- Each result stays within 128 KiB of JSON (the body sample is shortened first, then headers).
+- The result buffer also has a 64 MiB byte budget: body samples of the oldest results go first,
+  then the oldest results. Result batches are capped at 8 MiB.
+- TLS checks read the certificate of an untrusted or expired server from the failed handshake
+  instead of opening a second connection; checks with `verify_tls = false` still verify the chain
+  and report the outcome in the details without failing.
+
 ## [1.0.0] – not yet released
 
 First release, implementing the bynh agent protocol v1.
