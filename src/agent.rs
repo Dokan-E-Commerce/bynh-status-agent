@@ -36,6 +36,10 @@ pub struct Tunables {
     pub max_batches_per_tick: usize,
     /// Buffer capacity (the protocol's 10,000).
     pub buffer_capacity: usize,
+    /// Byte budget of the buffer (serialised results).
+    pub buffer_max_bytes: usize,
+    /// Largest results batch, in serialised bytes.
+    pub batch_max_bytes: usize,
 }
 
 impl Default for Tunables {
@@ -49,6 +53,8 @@ impl Default for Tunables {
             request_timeout: Duration::from_secs(30),
             max_batches_per_tick: 20,
             buffer_capacity: crate::buffer::DEFAULT_CAPACITY,
+            buffer_max_bytes: crate::buffer::DEFAULT_MAX_BYTES,
+            batch_max_bytes: crate::buffer::DEFAULT_BATCH_BYTES,
         }
     }
 }
@@ -112,7 +118,10 @@ impl Agent {
             prober = prober.with_proxy(config.proxy.clone());
         }
         let prober = Arc::new(prober);
-        let buffer = Arc::new(ResultBuffer::new(tun.buffer_capacity));
+        let buffer = Arc::new(ResultBuffer::with_limits(
+            tun.buffer_capacity,
+            tun.buffer_max_bytes,
+        ));
         let scheduler = Scheduler::new(prober, buffer.clone(), config.concurrency);
         let client = PlatformClient::new(net, &config.api_url, &token, tun.request_timeout)
             .with_proxy(config.proxy.clone());
@@ -382,11 +391,15 @@ impl Agent {
             tracing::warn!(
                 dropped,
                 dropped_total = self.buffer.dropped_total(),
+                buffered_bytes = self.buffer.bytes(),
                 "result buffer full; oldest results were dropped"
             );
         }
         for _ in 0..max_batches {
-            let Some(batch) = self.buffer.peek(self.max_batch) else {
+            let Some(batch) = self
+                .buffer
+                .peek_bytes(self.max_batch, self.tun.batch_max_bytes)
+            else {
                 break;
             };
             match self.client.results(&batch.results).await {

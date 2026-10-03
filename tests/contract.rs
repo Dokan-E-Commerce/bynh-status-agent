@@ -86,3 +86,162 @@ fn check_types_match() {
         assert!(line.contains(&format!("\"{t}\"")));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Check details (agent 1.1.0)
+
+use bynh_status_agent::details::{
+    BodyDetails, DetailTimings, Details, RedirectHop, RequestInfo, TlsDetails, REDACT_ALWAYS,
+    REDACT_EXEMPT, REDACT_PARTS,
+};
+
+/// The `details` example in the "Check details" section of PROTOCOL.md.
+fn details_block() -> &'static str {
+    let section = PROTOCOL_LF
+        .split("## Check details (agent 1.1.0)\n")
+        .nth(1)
+        .expect("PROTOCOL.md has a Check details section");
+    let start = section.find("```json\n").expect("details example") + "```json\n".len();
+    let end = start + section[start..].find("```").unwrap();
+    &section[start..end]
+}
+
+/// Keys written as `"name":` in a piece of the document.
+fn documented_keys(text: &str) -> std::collections::BTreeSet<String> {
+    let b = text.as_bytes();
+    let mut keys = std::collections::BTreeSet::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'"' {
+            let rest = &text[i + 1..];
+            let len = rest
+                .bytes()
+                .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_')
+                .count();
+            if len > 0 && rest[len..].starts_with("\":") {
+                keys.insert(rest[..len].to_owned());
+                i += len + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    keys
+}
+
+/// Every object key in a JSON value, recursively.
+fn serialised_keys(v: &serde_json::Value, out: &mut std::collections::BTreeSet<String>) {
+    match v {
+        serde_json::Value::Object(m) => {
+            for (k, v) in m {
+                out.insert(k.clone());
+                serialised_keys(v, out);
+            }
+        }
+        serde_json::Value::Array(a) => a.iter().for_each(|v| serialised_keys(v, out)),
+        _ => {}
+    }
+}
+
+/// Details with every optional field present.
+fn full_details() -> Details {
+    Details {
+        http_version: Some("HTTP/1.1"),
+        ip_family: Some("4"),
+        request: Some(RequestInfo {
+            method: "GET".into(),
+            url: "https://shop.example.com/health".into(),
+        }),
+        status_text: Some("OK".into()),
+        response_headers: vec![("server".into(), "nginx".into())],
+        body: Some(BodyDetails {
+            sample: Some("ok".into()),
+            sample_base64: false,
+            truncated: false,
+            size: Some(2),
+            sha256: Some("00".into()),
+            content_type: Some("text/plain".into()),
+        }),
+        redirects: vec![RedirectHop {
+            url: "https://shop.example.com/health".into(),
+            status: 301,
+            duration_ms: 41,
+            remote_ip: Some("203.0.113.5".into()),
+        }],
+        tls: Some(TlsDetails {
+            protocol: Some("TLSv1.3".into()),
+            cipher: Some("TLS13_AES_256_GCM_SHA384".into()),
+            subject: Some("CN=shop.example.com".into()),
+            issuer: Some("CN=R11".into()),
+            sans: vec!["shop.example.com".into()],
+            not_before: Some("2026-09-01T00:00:00.000Z".into()),
+            not_after: Some("2026-11-30T23:59:59.000Z".into()),
+            fingerprint_sha256: Some("00".into()),
+            chain_length: 2,
+            verified: true,
+            verify_error: None,
+        }),
+        timings: Some(DetailTimings {
+            dns_ms: Some(5),
+            connect_ms: Some(20),
+            tls_ms: Some(40),
+            ttfb_ms: Some(150),
+            download_ms: Some(30),
+            total_ms: Some(250),
+        }),
+    }
+}
+
+#[test]
+fn details_fields_match() {
+    let mut doc = documented_keys(details_block());
+    assert!(doc.remove("details"));
+    let mut ser = std::collections::BTreeSet::new();
+    serialised_keys(&serde_json::to_value(full_details()).unwrap(), &mut ser);
+    assert_eq!(
+        doc, ser,
+        "PROTOCOL.md details example and the agent disagree"
+    );
+    assert!(details_block().trim_start().starts_with("\"details\": {"));
+    assert!(line_with("\"response_bytes\":").contains("1234"));
+    assert!(PROTOCOL_LF.contains("\"details\": { … } }"));
+}
+
+#[test]
+fn capture_body_is_documented_and_parsed() {
+    let line = line_with("\"capture_body\":");
+    assert!(line.contains("default true"), "{line}");
+    let doc = br#"{ "config_version": "c", "checks": [
+        { "id": "a", "type": "http", "url": "https://example.com/", "capture_body": false },
+        { "id": "b", "type": "http", "url": "https://example.com/" } ] }"#;
+    let a = bynh_status_agent::protocol::Assignments::parse(doc).unwrap();
+    assert!(!a.checks[0].capture_body);
+    assert!(a.checks[1].capture_body);
+}
+
+#[test]
+fn redaction_list_matches() {
+    let rules = PROTOCOL_LF
+        .split("**Redaction on the agent**")
+        .nth(1)
+        .expect("redaction rule")
+        .split("\n- **")
+        .next()
+        .unwrap();
+    for name in REDACT_ALWAYS
+        .iter()
+        .chain(REDACT_PARTS)
+        .chain(REDACT_EXEMPT)
+    {
+        assert!(
+            rules.contains(&format!("`{name}`")),
+            "{name} not documented"
+        );
+    }
+    let documented = rules.matches('`').count() / 2;
+    assert_eq!(
+        documented,
+        REDACT_ALWAYS.len() + REDACT_PARTS.len() + REDACT_EXEMPT.len() + 2,
+        "PROTOCOL.md lists names the agent doesn't (+2: the placeholder and the monitor's `auth`): {rules}"
+    );
+}

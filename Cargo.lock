@@ -228,6 +228,7 @@ dependencies = [
  "libc",
  "memchr",
  "rcgen",
+ "ring",
  "rustls",
  "serde",
  "serde_json",

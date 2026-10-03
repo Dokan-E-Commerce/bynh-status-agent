@@ -11,16 +11,14 @@ use http::header::{self, HeaderName, HeaderValue};
 use http::{HeaderMap, Method};
 use time::OffsetDateTime;
 
-use crate::net::{self, HttpRequest, Net, Trace};
+use crate::details::{self, DetailTimings, Details, RedirectHop, RequestInfo};
+use crate::net::{self, Capture, HttpRequest, Net, Trace};
 use crate::netguard::Guard;
 use crate::protocol::{rfc3339, Auth, Check, CheckError, CheckResult, CheckType, ErrorKind};
 use crate::proxy::{ProxyEndpoint, ProxySettings};
 
 /// Maximum number of response body bytes read per request.
 pub const MAX_BODY: usize = 1 << 20;
-/// Time allowed for the second handshake that reads an untrusted
-/// certificate's expiry.
-const TLS_FALLBACK_TIMEOUT: Duration = Duration::from_secs(2);
 /// Upper bound on a check's timeout, whatever the platform sends.
 pub const MAX_TIMEOUT_MS: u64 = 120_000;
 
@@ -34,9 +32,16 @@ pub struct Prober {
 
 #[derive(Default)]
 struct Outcome {
+    /// The last request (or connection) made.
     trace: Trace,
     status_code: Option<u16>,
     response_bytes: Option<u64>,
+    /// The request as configured (http and keyword checks).
+    request: Option<RequestInfo>,
+    /// Redirects followed, in order.
+    redirects: Vec<RedirectHop>,
+    /// Whole tcp/tls check, connection and handshake.
+    total_ms: Option<u64>,
 }
 
 fn other(msg: impl Into<String>) -> CheckError {
@@ -90,7 +95,8 @@ impl Prober {
             || t.connect_ms.is_some()
             || t.tls_ms.is_some()
             || t.ttfb_ms.is_some();
-        CheckResult {
+        let details = self.details(check, &mut out);
+        let mut result = CheckResult {
             check_id: check.id.clone(),
             started_at: rfc3339(started_at),
             duration_ms: net::ms(start.elapsed()),
@@ -105,7 +111,41 @@ impl Prober {
                 None
             },
             response_bytes: out.response_bytes,
+            details: Some(details),
+        };
+        details::fit_budget(&mut result, details::MAX_RESULT_BYTES);
+        result
+    }
+
+    /// Check details from what was gathered, up to the phase that failed.
+    fn details(&self, check: &Check, out: &mut Outcome) -> Details {
+        let trace = &out.trace;
+        let response = trace.response.as_ref();
+        let t = &trace.timings;
+        let timings = DetailTimings {
+            dns_ms: t.dns_ms,
+            connect_ms: t.connect_ms,
+            tls_ms: t.tls_ms,
+            ttfb_ms: t.ttfb_ms,
+            download_ms: trace.download_ms,
+            total_ms: trace.total_ms.or(out.total_ms),
+        };
+        let skip = out.redirects.len().saturating_sub(details::MAX_REDIRECTS);
+        Details {
+            http_version: response.and_then(|r| r.http_version),
+            ip_family: trace.remote_ip.map(details::ip_family),
+            request: out.request.take(),
+            status_text: response.and_then(|r| r.status_text.clone()),
+            response_headers: response.map(|r| r.headers.clone()).unwrap_or_default(),
+            body: trace
+                .body
+                .as_ref()
+                .map(|b| b.finish(response.and_then(|r| r.content_type.clone()))),
+            redirects: out.redirects.drain(skip..).collect(),
+            tls: trace.tls.clone(),
+            timings: (!timings.is_empty()).then_some(timings),
         }
+        .with_capture(check.capture_body)
     }
 
     async fn execute(&self, check: &Check, out: &mut Outcome) -> Result<(), CheckError> {
@@ -166,6 +206,15 @@ impl Prober {
             _ => None,
         };
 
+        out.request = Some(RequestInfo {
+            method: upper.clone(),
+            url: details::cap(url.as_str(), details::MAX_URL),
+        });
+        let capture = if check.capture_body {
+            Capture::Sample
+        } else {
+            Capture::Metadata
+        };
         let mut hops = 0u32;
         loop {
             out.trace = Trace::default();
@@ -185,6 +234,7 @@ impl Prober {
                         proxy: self.proxy.as_deref().and_then(|p| p.for_url(&url)),
                         max_body: MAX_BODY,
                         keep_body: keyword.is_some(),
+                        capture,
                     },
                     &mut out.trace,
                 )
@@ -227,6 +277,12 @@ impl Prober {
                     if rules::crosses_origin(&url, &next) {
                         headers = rules::cross_origin_headers(&headers, keep_body);
                     }
+                    out.redirects.push(RedirectHop {
+                        url: details::cap(next.as_str(), details::MAX_URL),
+                        status: resp.status,
+                        duration_ms: out.trace.total_ms.unwrap_or(0),
+                        remote_ip: self.reported_ip(&out.trace),
+                    });
                     method = m;
                     url = next;
                     hops += 1;
@@ -259,7 +315,29 @@ impl Prober {
         }
     }
 
+    fn reported_ip(&self, trace: &Trace) -> Option<String> {
+        if self.report_ip {
+            trace.remote_ip.map(|ip| ip.to_string())
+        } else {
+            None
+        }
+    }
+
     async fn tcp(&self, check: &Check, out: &mut Outcome) -> Result<(), CheckError> {
+        let start = Instant::now();
+        let r = self.tcp_inner(check, out).await;
+        out.total_ms = Some(net::ms(start.elapsed()));
+        r
+    }
+
+    async fn tls(&self, check: &Check, out: &mut Outcome) -> Result<(), CheckError> {
+        let start = Instant::now();
+        let r = self.tls_inner(check, out).await;
+        out.total_ms = Some(net::ms(start.elapsed()));
+        r
+    }
+
+    async fn tcp_inner(&self, check: &Check, out: &mut Outcome) -> Result<(), CheckError> {
         let (host, port) = host_port(check, None)?;
         let proxy = self.proxy_for_host(&host);
         self.net
@@ -275,7 +353,7 @@ impl Prober {
         Ok(())
     }
 
-    async fn tls(&self, check: &Check, out: &mut Outcome) -> Result<(), CheckError> {
+    async fn tls_inner(&self, check: &Check, out: &mut Outcome) -> Result<(), CheckError> {
         let (host, port) = host_port(check, Some(443))?;
         let proxy = self.proxy_for_host(&host);
         let tcp = self
@@ -294,32 +372,9 @@ impl Prober {
             .tls_handshake(tcp, &host, check.verify_tls, &mut out.trace)
             .await
         {
-            if check.verify_tls {
-                // Learn the expiry anyway, so an expired or untrusted certificate
-                // still reports when it expires.
-                // Bounded separately so it can't turn a TLS error into a timeout.
-                let mut probe = Trace::default();
-                let fallback = async {
-                    let tcp = self
-                        .net
-                        .connect_target(
-                            &host,
-                            port,
-                            check.ip_version,
-                            &self.guard,
-                            proxy,
-                            &mut probe,
-                        )
-                        .await?;
-                    self.net
-                        .tls_handshake(tcp, &host, false, &mut probe)
-                        .await?;
-                    Ok::<_, CheckError>(())
-                };
-                if let Ok(Ok(())) = tokio::time::timeout(TLS_FALLBACK_TIMEOUT, fallback).await {
-                    out.trace.tls_expires_at = probe.tls_expires_at;
-                }
-            }
+            // An expired or untrusted certificate still reports when it
+            // expires: the verifier saw it before the handshake failed.
+            out.trace.tls_expires_at = out.trace.peer_not_after;
             return Err(e);
         }
         match out.trace.tls_expires_at {

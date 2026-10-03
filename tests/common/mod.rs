@@ -33,6 +33,10 @@ async fn serve(app: Router) -> SocketAddr {
     addr
 }
 
+/// Body of `/page`.
+pub const PAGE: &str =
+    "<!doctype html><html><head><title>shop</title></head><body>status: OK</body></html>";
+
 #[derive(serde::Deserialize)]
 struct To {
     to: String,
@@ -104,6 +108,29 @@ pub async fn spawn_target() -> SocketAddr {
             )
             .route("/post-303", post(|| async { Redirect::to("/echo") }))
             .route(
+                "/page",
+                get(|| async {
+                    (
+                        [
+                            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                            (header::SET_COOKIE, "sid=hunter2; HttpOnly"),
+                            (header::SERVER, "test-server"),
+                        ],
+                        [("x-api-key", "hunter4"), ("x-request-id", "req-1")],
+                        PAGE,
+                    )
+                }),
+            )
+            .route(
+                "/binary",
+                get(|| async {
+                    (
+                        [(header::CONTENT_TYPE, "image/png")],
+                        (0..=255u8).collect::<Vec<u8>>(),
+                    )
+                }),
+            )
+            .route(
                 "/to-nonascii",
                 get(|| async {
                     let mut r = StatusCode::FOUND.into_response();
@@ -125,13 +152,49 @@ pub async fn spawn_tls(not_after: OffsetDateTime) -> SocketAddr {
     params.not_after = not_after;
     let key = rcgen::KeyPair::generate().unwrap();
     let cert = params.self_signed(&key).unwrap();
+    serve_tls(vec![cert.der().clone()], key).await
+}
+
+/// An HTTPS server for `localhost` with a certificate issued by a test CA
+/// ("CN=bynh test CA"). The server sends the leaf and the CA. Returns the
+/// address and the CA certificate as PEM.
+pub async fn spawn_tls_ca() -> (SocketAddr, String) {
+    let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+    ];
+    let mut dn = rcgen::DistinguishedName::new();
+    dn.push(rcgen::DnType::CommonName, "bynh test CA");
+    ca_params.distinguished_name = dn;
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let issuer = rcgen::Issuer::new(ca_params, ca_key);
+
+    let mut params =
+        rcgen::CertificateParams::new(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])
+            .unwrap();
+    let mut dn = rcgen::DistinguishedName::new();
+    dn.push(rcgen::DnType::CommonName, "localhost");
+    params.distinguished_name = dn;
+    let key = rcgen::KeyPair::generate().unwrap();
+    let leaf = params.signed_by(&key, &issuer).unwrap();
+    let addr = serve_tls(vec![leaf.der().clone(), ca.der().clone()], key).await;
+    (addr, ca.pem())
+}
+
+async fn serve_tls(
+    chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rcgen::KeyPair,
+) -> SocketAddr {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_no_client_auth()
         .with_single_cert(
-            vec![cert.der().clone()],
+            chain,
             rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
         )
         .unwrap();
@@ -158,10 +221,38 @@ pub async fn spawn_tls(not_after: OffsetDateTime) -> SocketAddr {
                 }
                 let _ = tls
                     .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nsecure",
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 6\r\nConnection: close\r\n\r\nsecure",
                     )
                     .await;
                 let _ = tls.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+/// A raw HTTP server that answers every request with `head` + `body` and
+/// then keeps the connection open for `hold` (to test timeouts mid-body).
+pub async fn spawn_raw(head: &'static str, body: &'static [u8], hold: Duration) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut tcp, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match tcp.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let _ = tcp.write_all(head.as_bytes()).await;
+                let _ = tcp.write_all(body).await;
+                tokio::time::sleep(hold).await;
             });
         }
     });

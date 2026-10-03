@@ -294,6 +294,7 @@ mod tests {
                     tls_expires_at: None,
                     remote_ip: None,
                     response_bytes: None,
+                    details: None,
                 }
             }
         }

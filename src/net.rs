@@ -4,7 +4,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -15,11 +15,13 @@ use http::{header, HeaderMap, HeaderValue, Method, Request};
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::client::Resumption;
+use rustls::client::{Resumption, WebPkiServerVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
+
+use crate::details::{BodyCapture, TlsDetails};
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -30,11 +32,12 @@ use crate::netguard::Guard;
 use crate::protocol::{CheckError, ErrorKind, IpVersion, Timings};
 use crate::proxy::ProxyEndpoint;
 
-/// Shared networking context: one DNS resolver and the two TLS configurations.
+/// Shared networking context: one DNS resolver and the certificate verifier
+/// (bundled Mozilla roots plus `ca_file`).
 pub struct Net {
     resolver: TokioResolver,
-    tls_verify: Arc<ClientConfig>,
-    tls_insecure: Arc<ClientConfig>,
+    provider: Arc<CryptoProvider>,
+    webpki: Arc<WebPkiServerVerifier>,
 }
 
 /// What we learned about a connection while making it. Filled progressively,
@@ -43,7 +46,41 @@ pub struct Net {
 pub struct Trace {
     pub timings: Timings,
     pub remote_ip: Option<IpAddr>,
+    /// The certificate's notAfter after a successful handshake.
     pub tls_expires_at: Option<OffsetDateTime>,
+    /// The certificate's notAfter, also when the handshake failed.
+    pub peer_not_after: Option<OffsetDateTime>,
+    /// TLS details, also when the handshake failed after the certificate.
+    pub tls: Option<TlsDetails>,
+    /// Response line and headers (only with [`Capture`] other than `Off`).
+    pub response: Option<ResponseMeta>,
+    /// Body read so far (only with [`Capture`] other than `Off`).
+    pub body: Option<BodyCapture>,
+    /// From the response headers to the end of the body read.
+    pub download_ms: Option<u64>,
+    /// The whole request, from DNS to the end of the body read (also when
+    /// it failed, but not when it was cut off by a timeout).
+    pub total_ms: Option<u64>,
+}
+
+/// Response metadata captured for check details, already redacted.
+#[derive(Debug, Clone)]
+pub struct ResponseMeta {
+    pub http_version: Option<&'static str>,
+    pub status_text: Option<String>,
+    pub headers: Vec<(String, String)>,
+    pub content_type: Option<String>,
+}
+
+/// What [`Net::http`] records about the response for check details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capture {
+    /// Nothing (platform requests).
+    Off,
+    /// Headers, body size and hash, no body content.
+    Metadata,
+    /// Also the first 64 KiB of the body.
+    Sample,
 }
 
 /// One HTTP request to one URL (no redirect handling here).
@@ -63,6 +100,8 @@ pub struct HttpRequest<'a> {
     /// Keep the body in memory (keyword checks, platform responses). When
     /// false the bytes are only counted.
     pub keep_body: bool,
+    /// Response details to record in the trace.
+    pub capture: Capture,
 }
 
 #[derive(Debug)]
@@ -84,11 +123,12 @@ impl Net {
     /// DNS if none is readable) and TLS configurations. `ca_file` adds PEM
     /// roots on top of the bundled Mozilla roots, for internal CAs.
     pub fn new(ca_file: Option<&Path>) -> Result<Self, String> {
-        let (tls_verify, tls_insecure) = tls_configs(ca_file)?;
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let webpki = webpki_verifier(ca_file, provider.clone())?;
         Ok(Self {
             resolver: build_resolver()?,
-            tls_verify,
-            tls_insecure,
+            provider,
+            webpki,
         })
     }
 
@@ -189,8 +229,12 @@ impl Net {
         }
     }
 
-    /// Runs a TLS handshake over `tcp`. Fills `trace.timings.tls_ms` and
-    /// `trace.tls_expires_at` (the leaf certificate's notAfter).
+    /// Runs a TLS handshake over `tcp`. Fills `trace.timings.tls_ms`,
+    /// `trace.tls_expires_at` (the leaf certificate's notAfter) and
+    /// `trace.tls`. The chain is always verified; with `verify = false` a
+    /// failed verification is recorded in `trace.tls` but doesn't stop the
+    /// handshake. If the handshake fails after the certificate arrived,
+    /// `trace.tls` and `trace.peer_not_after` still describe it.
     pub async fn tls_handshake(
         &self,
         tcp: TcpStream,
@@ -200,16 +244,46 @@ impl Net {
     ) -> Result<TlsStream<TcpStream>, CheckError> {
         let name = ServerName::try_from(host.to_owned())
             .map_err(|_| CheckError::new(ErrorKind::Tls, "invalid TLS server name"))?;
-        let config = if verify {
-            self.tls_verify.clone()
-        } else {
-            self.tls_insecure.clone()
-        };
+        let recorder = Arc::new(Recorder {
+            inner: self.webpki.clone(),
+            enforce: verify,
+            seen: Mutex::new(None),
+        });
+        let mut config = ClientConfig::builder_with_provider(self.provider.clone())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| CheckError::new(ErrorKind::Tls, e.to_string()))?
+            .dangerous()
+            .with_custom_certificate_verifier(recorder.clone())
+            .with_no_client_auth();
+        // Every check measures a full handshake and sees the current certificate.
+        config.resumption = Resumption::disabled();
         let start = Instant::now();
-        let stream = TlsConnector::from(config)
+        let result = TlsConnector::from(Arc::new(config))
             .connect(name, tcp)
-            .await
-            .map_err(tls_error)?;
+            .await;
+        let seen = recorder.take();
+        let (protocol, cipher) = match &result {
+            Ok(s) => {
+                let conn = &s.get_ref().1;
+                (
+                    conn.protocol_version(),
+                    conn.negotiated_cipher_suite().map(|c| c.suite()),
+                )
+            }
+            Err(_) => (None, None),
+        };
+        if let Some(seen) = seen {
+            let (details, not_after) = crate::details::tls_details(
+                &seen.leaf,
+                seen.chain_length,
+                protocol,
+                cipher,
+                seen.error.as_ref().map(rustls_error_text),
+            );
+            trace.tls = Some(details);
+            trace.peer_not_after = not_after;
+        }
+        let stream = result.map_err(tls_error)?;
         trace.timings.tls_ms = Some(ms(start.elapsed()));
         trace.tls_expires_at = stream
             .get_ref()
@@ -222,6 +296,17 @@ impl Net {
 
     /// One HTTP/1.1 request on a fresh connection. Fills `trace` as it goes.
     pub async fn http(
+        &self,
+        req: HttpRequest<'_>,
+        trace: &mut Trace,
+    ) -> Result<HttpResponse, CheckError> {
+        let start = Instant::now();
+        let r = self.http_inner(req, trace).await;
+        trace.total_ms = Some(ms(start.elapsed()));
+        r
+    }
+
+    async fn http_inner(
         &self,
         req: HttpRequest<'_>,
         trace: &mut Trace,
@@ -311,14 +396,19 @@ impl Net {
             .body(Full::new(body))
             .map_err(|e| CheckError::new(ErrorKind::Other, format!("invalid request: {e}")))?;
 
-        let is_head = req.method == Method::HEAD;
+        let opts = ExchangeOpts {
+            max_body: req.max_body,
+            keep_body: req.keep_body,
+            is_head: req.method == Method::HEAD,
+            capture: req.capture,
+        };
         if https {
             let tls = self
                 .tls_handshake(tcp, &host, req.verify_tls, trace)
                 .await?;
-            exchange(tls, request, req.max_body, req.keep_body, is_head, trace).await
+            exchange(tls, request, opts, trace).await
         } else {
-            exchange(tcp, request, req.max_body, req.keep_body, is_head, trace).await
+            exchange(tcp, request, opts, trace).await
         }
     }
 }
@@ -470,12 +560,17 @@ impl Drop for AbortOnDrop {
     }
 }
 
-async fn exchange<S>(
-    io: S,
-    request: Request<Full<Bytes>>,
+struct ExchangeOpts {
     max_body: usize,
     keep_body: bool,
     is_head: bool,
+    capture: Capture,
+}
+
+async fn exchange<S>(
+    io: S,
+    request: Request<Full<Bytes>>,
+    opts: ExchangeOpts,
     trace: &mut Trace,
 ) -> Result<HttpResponse, CheckError>
 where
@@ -492,10 +587,25 @@ where
         CheckError::new(ErrorKind::Other, format!("HTTP request: {}", hyper_msg(&e)))
     })?;
     trace.timings.ttfb_ms = Some(ms(start.elapsed()));
+    let download = Instant::now();
     let (parts, mut body) = response.into_parts();
+    if opts.capture != Capture::Off {
+        let reason = parts
+            .extensions
+            .get::<hyper::ext::ReasonPhrase>()
+            .map(|r| r.as_bytes());
+        trace.response = Some(ResponseMeta {
+            http_version: crate::details::http_version(parts.version),
+            status_text: crate::details::status_text(reason, parts.status),
+            headers: crate::details::capture_headers(&parts.headers),
+            content_type: crate::details::content_type(&parts.headers),
+        });
+        trace.body = Some(BodyCapture::new(opts.capture == Capture::Sample));
+    }
+    let max_body = opts.max_body;
     let mut buf = BytesMut::new();
     let mut read = 0usize;
-    if !is_head {
+    if !opts.is_head {
         while read < max_body {
             match body.frame().await {
                 None => break,
@@ -508,15 +618,27 @@ where
                 Some(Ok(frame)) => {
                     if let Ok(data) = frame.into_data() {
                         let take = data.len().min(max_body - read);
-                        if keep_body {
+                        if opts.keep_body {
                             buf.extend_from_slice(&data[..take]);
+                        }
+                        if let Some(capture) = trace.body.as_mut() {
+                            capture.push(&data[..take]);
+                            if take < data.len() {
+                                capture.set_more();
+                            }
                         }
                         read += take;
                     }
                 }
             }
         }
+        if read >= max_body && !hyper::body::Body::is_end_stream(&body) {
+            if let Some(capture) = trace.body.as_mut() {
+                capture.set_more();
+            }
+        }
     }
+    trace.download_ms = Some(ms(download.elapsed()));
     Ok(HttpResponse {
         status: parts.status.as_u16(),
         headers: parts.headers,
@@ -535,11 +657,17 @@ fn hyper_msg(e: &hyper::Error) -> String {
 
 fn tls_error(e: std::io::Error) -> CheckError {
     let msg = match e.get_ref().and_then(|i| i.downcast_ref::<rustls::Error>()) {
-        Some(rustls::Error::InvalidCertificate(c)) => cert_error_text(c),
-        Some(other) => other.to_string(),
+        Some(err) => rustls_error_text(err),
         None => e.to_string(),
     };
     CheckError::new(ErrorKind::Tls, format!("TLS handshake failed: {msg}"))
+}
+
+fn rustls_error_text(e: &rustls::Error) -> String {
+    match e {
+        rustls::Error::InvalidCertificate(c) => cert_error_text(c),
+        other => other.to_string(),
+    }
 }
 
 fn cert_error_text(c: &rustls::CertificateError) -> String {
@@ -585,8 +713,10 @@ fn build_resolver() -> Result<TokioResolver, String> {
     builder.build().map_err(|e| format!("DNS resolver: {e}"))
 }
 
-fn tls_configs(ca_file: Option<&Path>) -> Result<(Arc<ClientConfig>, Arc<ClientConfig>), String> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+fn webpki_verifier(
+    ca_file: Option<&Path>,
+    provider: Arc<CryptoProvider>,
+) -> Result<Arc<WebPkiServerVerifier>, String> {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     if let Some(path) = ca_file {
@@ -604,41 +734,70 @@ fn tls_configs(ca_file: Option<&Path>) -> Result<(Arc<ClientConfig>, Arc<ClientC
             return Err(format!("ca_file {}: no certificates found", path.display()));
         }
     }
-
-    let mut verify = ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .map_err(|e| e.to_string())?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    // Every check measures a full handshake and sees the current certificate.
-    verify.resumption = Resumption::disabled();
-
-    let mut insecure = ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .map_err(|e| e.to_string())?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
-        .with_no_client_auth();
-    insecure.resumption = Resumption::disabled();
-
-    Ok((Arc::new(verify), Arc::new(insecure)))
+    WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+        .build()
+        .map_err(|e| e.to_string())
 }
 
-/// Used only for checks with `verify_tls = false`: accepts any certificate,
-/// but still checks the handshake signatures.
-#[derive(Debug)]
-struct AcceptAnyCert(Arc<CryptoProvider>);
+/// What the verifier saw: the leaf certificate, the chain length and the
+/// verification outcome.
+struct Seen {
+    leaf: Vec<u8>,
+    chain_length: usize,
+    error: Option<rustls::Error>,
+}
 
-impl ServerCertVerifier for AcceptAnyCert {
+/// Verifies the server certificate with webpki and records what it saw, so
+/// check details can describe the certificate even when verification
+/// fails. With `enforce = false` (checks with `verify_tls = false`) a failed
+/// verification is recorded but accepted. Handshake signatures are always
+/// checked.
+struct Recorder {
+    inner: Arc<WebPkiServerVerifier>,
+    enforce: bool,
+    seen: Mutex<Option<Seen>>,
+}
+
+impl Recorder {
+    fn take(&self) -> Option<Seen> {
+        self.seen.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+impl std::fmt::Debug for Recorder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Recorder")
+            .field("enforce", &self.enforce)
+            .finish()
+    }
+}
+
+impl ServerCertVerifier for Recorder {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
+        let result = self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        );
+        *self.seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(Seen {
+            leaf: end_entity.as_ref().to_vec(),
+            chain_length: 1 + intermediates.len(),
+            error: result.as_ref().err().cloned(),
+        });
+        if self.enforce {
+            result
+        } else {
+            Ok(ServerCertVerified::assertion())
+        }
     }
 
     fn verify_tls12_signature(
@@ -647,12 +806,7 @@ impl ServerCertVerifier for AcceptAnyCert {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
+        self.inner.verify_tls12_signature(message, cert, dss)
     }
 
     fn verify_tls13_signature(
@@ -661,16 +815,11 @@ impl ServerCertVerifier for AcceptAnyCert {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
+        self.inner.verify_tls13_signature(message, cert, dss)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
+        self.inner.supported_verify_schemes()
     }
 }
 

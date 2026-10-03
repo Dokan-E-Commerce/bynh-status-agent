@@ -10,7 +10,7 @@ use flate2::write::GzEncoder;
 use http::header::{self, HeaderValue};
 use http::{HeaderMap, Method};
 
-use crate::net::{HttpRequest, Net, Trace};
+use crate::net::{Capture, HttpRequest, Net, Trace};
 use crate::netguard::Guard;
 use crate::protocol::{
     user_agent, Assignments, CheckResult, HelloRequest, HelloResponse, IpVersion, ResultsRequest,
@@ -130,8 +130,9 @@ impl PlatformClient {
         Ok(AssignmentsOutcome::Changed { assignments, etag })
     }
 
-    pub async fn results(&self, results: &[CheckResult]) -> Result<ResultsResponse, ApiError> {
-        let body = serde_json::to_vec(&ResultsRequest { results })
+    pub async fn results(&self, results: &[Arc<CheckResult>]) -> Result<ResultsResponse, ApiError> {
+        let refs: Vec<&CheckResult> = results.iter().map(|r| r.as_ref()).collect();
+        let body = serde_json::to_vec(&ResultsRequest { results: &refs })
             .map_err(|e| decode_err(e.to_string()))?;
         let resp = self
             .send(Method::POST, PATH_RESULTS, Some(body), true, None)
@@ -202,6 +203,7 @@ impl PlatformClient {
                 proxy: self.proxy.for_url(&url),
                 max_body: MAX_RESPONSE,
                 keep_body: true,
+                capture: Capture::Off,
             },
             &mut trace,
         );

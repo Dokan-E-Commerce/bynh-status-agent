@@ -251,6 +251,9 @@ pub struct Check {
     pub verify_tls: bool,
     #[serde(default, deserialize_with = "null_default")]
     pub ip_version: IpVersion,
+    /// Send a body sample with the result's details (default true).
+    #[serde(default = "default_true", deserialize_with = "bool_or_true")]
+    pub capture_body: bool,
 }
 
 fn default_method() -> String {
@@ -297,6 +300,7 @@ impl fmt::Debug for Check {
             .field("max_redirects", &self.max_redirects)
             .field("verify_tls", &self.verify_tls)
             .field("ip_version", &self.ip_version)
+            .field("capture_body", &self.capture_body)
             .finish()
     }
 }
@@ -395,6 +399,7 @@ impl Check {
             max_redirects: default_max_redirects(),
             verify_tls: true,
             ip_version: IpVersion::Any,
+            capture_body: true,
         }
     }
 }
@@ -467,11 +472,15 @@ pub struct CheckResult {
     pub tls_expires_at: Option<String>,
     pub remote_ip: Option<String>,
     pub response_bytes: Option<u64>,
+    /// Check details (agent 1.1.0). Absent only on results built outside the
+    /// prober.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<crate::details::Details>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ResultsRequest<'a> {
-    pub results: &'a [CheckResult],
+    pub results: &'a [&'a CheckResult],
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -552,6 +561,18 @@ mod tests {
         assert_eq!(tcp.port, Some(5432));
         assert_eq!(tcp.method, "GET");
         assert!(tcp.follow_redirects && tcp.verify_tls);
+        assert!(
+            c.capture_body && tcp.capture_body,
+            "capture_body defaults to true"
+        );
+    }
+
+    #[test]
+    fn capture_body_can_be_turned_off() {
+        let a = parse_one(serde_json::json!({ "capture_body": false }));
+        assert!(!a.checks[0].capture_body);
+        let a = parse_one(serde_json::json!({ "capture_body": null }));
+        assert!(a.checks[0].capture_body);
     }
 
     fn check_json(extra: serde_json::Value) -> serde_json::Value {

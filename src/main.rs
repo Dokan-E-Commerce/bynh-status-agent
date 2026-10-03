@@ -37,7 +37,8 @@ struct Cli {
 enum Command {
     /// Connect to bynh and run assigned checks (the default).
     Run,
-    /// Run one check locally and print the result as JSON. Nothing is sent to bynh.
+    /// Run one check locally and print the result, with its details, as JSON.
+    /// Nothing is sent to bynh.
     Check(CheckArgs),
     /// Print the version.
     Version,
@@ -86,6 +87,9 @@ struct CheckArgs {
     /// Allow private and internal addresses for this check.
     #[arg(long)]
     allow_private: bool,
+    /// Leave the body sample out of the details (like `capture_body: false`).
+    #[arg(long)]
+    no_body: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -391,6 +395,7 @@ fn build_check(a: &CheckArgs) -> Result<Check, String> {
     c.follow_redirects = !a.no_follow;
     c.max_redirects = a.max_redirects;
     c.verify_tls = !a.insecure;
+    c.capture_body = !a.no_body;
     c.ip_version = match a.ip_version.as_str() {
         "4" => IpVersion::V4,
         "6" => IpVersion::V6,

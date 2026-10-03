@@ -7,6 +7,7 @@ pub mod agent;
 pub mod backoff;
 pub mod buffer;
 pub mod config;
+pub mod details;
 pub mod net;
 pub mod netguard;
 pub mod platform;
