@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{Query, State};
+use axum::extract::{Query, RawQuery, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{any, get, post};
@@ -267,6 +267,10 @@ pub struct Call {
     pub at: Instant,
     pub headers: HeaderMap,
     pub status: u16,
+    /// The query string, if any (`wait=2` on a long poll).
+    pub query: Option<String>,
+    /// When the answer went out (a long poll may be held).
+    pub done: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -286,6 +290,12 @@ pub struct MockState {
     pub checks: Value,
     /// Scripted results responses: (status, Retry-After). Empty → 202.
     pub results_script: VecDeque<(u16, Option<String>)>,
+    /// Offered in hello (round robin); `None` leaves the field out like an older platform.
+    pub long_poll_seconds: Option<u64>,
+    /// The assignments' `confirm` list; left out while empty.
+    pub confirm: Value,
+    /// Whether `?wait=` polls are held (false: answered at once, like a platform without room).
+    pub hold: bool,
 
     pub hello_calls: Vec<Call>,
     pub assignment_calls: Vec<Call>,
@@ -304,6 +314,9 @@ impl Default for MockState {
             config_version: "c_1".into(),
             checks: json!([]),
             results_script: VecDeque::new(),
+            long_poll_seconds: None,
+            confirm: json!([]),
+            hold: true,
             hello_calls: Vec::new(),
             assignment_calls: Vec::new(),
             results_calls: Vec::new(),
@@ -327,17 +340,24 @@ async fn hello(State(m): State<Mock>, h: HeaderMap, body: Bytes) -> Response {
         at: Instant::now(),
         headers: h,
         status,
+        query: None,
+        done: Instant::now(),
     });
     match status {
-        200 => Json(json!({
-            "agent": { "id": "agt_test", "name": "Test probe", "kind": "own", "region": null, "location": null },
-            "poll_interval_seconds": s.poll_interval,
-            "report_interval_seconds": s.report_interval,
-            "max_batch": s.max_batch,
-            "minimum_version": "1.0.0",
-            "latest_version": "1.0.0"
-        }))
-        .into_response(),
+        200 => {
+            let mut body = json!({
+                "agent": { "id": "agt_test", "name": "Test probe", "kind": "own", "region": null, "location": null },
+                "poll_interval_seconds": s.poll_interval,
+                "report_interval_seconds": s.report_interval,
+                "max_batch": s.max_batch,
+                "minimum_version": "1.0.0",
+                "latest_version": "1.0.0"
+            });
+            if let Some(w) = s.long_poll_seconds {
+                body["long_poll_seconds"] = json!(w);
+            }
+            Json(body).into_response()
+        }
         426 => (
             StatusCode::UPGRADE_REQUIRED,
             Json(json!({ "message": "please upgrade", "minimum_version": s.hello_upgrade_min })),
@@ -347,13 +367,35 @@ async fn hello(State(m): State<Mock>, h: HeaderMap, body: Bytes) -> Response {
     }
 }
 
-async fn assignments(State(m): State<Mock>, h: HeaderMap) -> Response {
-    let mut s = m.lock().unwrap();
-    let etag = format!("\"{}\"", s.config_version);
+async fn assignments(State(m): State<Mock>, h: HeaderMap, RawQuery(query): RawQuery) -> Response {
+    let at = Instant::now();
     let inm = h
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    let wait = query
+        .as_deref()
+        .and_then(|q| q.strip_prefix("wait="))
+        .and_then(|w| w.parse::<u64>().ok());
+    // A long poll: while unchanged, hold up to `wait` seconds, answering as soon as it changes.
+    if let Some(w) = wait.filter(|_| m.lock().unwrap().hold) {
+        let deadline = at + Duration::from_secs(w);
+        loop {
+            {
+                let s = m.lock().unwrap();
+                let etag = format!("\"{}\"", s.config_version);
+                if s.assignments_status != 200 || inm.as_deref() != Some(etag.as_str()) {
+                    break;
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    let mut s = m.lock().unwrap();
+    let etag = format!("\"{}\"", s.config_version);
     let status = if s.assignments_status != 200 {
         s.assignments_status
     } else if inm.as_deref() == Some(etag.as_str()) {
@@ -362,16 +404,20 @@ async fn assignments(State(m): State<Mock>, h: HeaderMap) -> Response {
         200
     };
     s.assignment_calls.push(Call {
-        at: Instant::now(),
+        at,
         headers: h,
         status,
+        query,
+        done: Instant::now(),
     });
     match status {
-        200 => (
-            [(header::ETAG, etag)],
-            Json(json!({ "config_version": s.config_version, "checks": s.checks })),
-        )
-            .into_response(),
+        200 => {
+            let mut body = json!({ "config_version": s.config_version, "checks": s.checks });
+            if s.confirm.as_array().is_some_and(|c| !c.is_empty()) {
+                body["confirm"] = s.confirm.clone();
+            }
+            ([(header::ETAG, etag)], Json(body)).into_response()
+        }
         other => StatusCode::from_u16(other).unwrap().into_response(),
     }
 }
@@ -400,6 +446,8 @@ async fn results(State(m): State<Mock>, h: HeaderMap, body: Bytes) -> Response {
             at: Instant::now(),
             headers: h,
             status,
+            query: None,
+            done: Instant::now(),
         },
         results: list,
     });

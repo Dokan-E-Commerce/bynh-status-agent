@@ -22,6 +22,9 @@ use crate::proxy::ProxySettings;
 /// Largest platform response we accept, compressed and after decompression.
 pub const MAX_RESPONSE: usize = 8 << 20;
 
+/// A long poll's request timeout is the wait plus this much.
+pub const LONG_POLL_MARGIN_SECS: u64 = 15;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiError {
     /// 401: the token was revoked or is wrong.
@@ -111,10 +114,28 @@ impl PlatformClient {
         serde_json::from_slice(&resp.body).map_err(|e| decode_err(format!("hello response: {e}")))
     }
 
-    pub async fn assignments(&self, etag: Option<&str>) -> Result<AssignmentsOutcome, ApiError> {
-        let resp = self
-            .send(Method::GET, PATH_ASSIGNMENTS, None, false, etag)
-            .await?;
+    /// `wait`: long-poll (round robin, 1.2.0), letting the platform hold the request up to that
+    /// many seconds while nothing changed. The request timeout grows to cover the wait.
+    pub async fn assignments(
+        &self,
+        etag: Option<&str>,
+        wait: Option<u64>,
+    ) -> Result<AssignmentsOutcome, ApiError> {
+        let resp = match wait.filter(|w| *w > 0) {
+            Some(w) => {
+                let w = w.min(crate::protocol::limits::MAX_LONG_POLL_SECONDS);
+                let path = format!("{PATH_ASSIGNMENTS}?wait={w}");
+                let timeout = self
+                    .timeout
+                    .max(Duration::from_secs(w + LONG_POLL_MARGIN_SECS));
+                self.send_with(Method::GET, &path, None, false, etag, timeout)
+                    .await?
+            }
+            None => {
+                self.send(Method::GET, PATH_ASSIGNMENTS, None, false, etag)
+                    .await?
+            }
+        };
         if resp.status == 304 {
             return Ok(AssignmentsOutcome::NotModified);
         }
@@ -148,6 +169,19 @@ impl PlatformClient {
         body: Option<Vec<u8>>,
         gzip: bool,
         if_none_match: Option<&str>,
+    ) -> Result<Response, ApiError> {
+        self.send_with(method, path, body, gzip, if_none_match, self.timeout)
+            .await
+    }
+
+    async fn send_with(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Vec<u8>>,
+        gzip: bool,
+        if_none_match: Option<&str>,
+        timeout: Duration,
     ) -> Result<Response, ApiError> {
         let url =
             url::Url::parse(&format!("{}{}", self.base, path)).map_err(|e| ApiError::Rejected {
@@ -207,12 +241,12 @@ impl PlatformClient {
             },
             &mut trace,
         );
-        let resp = match tokio::time::timeout(self.timeout, fut).await {
+        let resp = match tokio::time::timeout(timeout, fut).await {
             Err(_) => {
                 return Err(ApiError::Retryable {
                     status: None,
                     retry_after: None,
-                    message: format!("request timed out after {:?}", self.timeout),
+                    message: format!("request timed out after {timeout:?}"),
                 })
             }
             Ok(Err(e)) => {

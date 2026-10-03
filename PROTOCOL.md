@@ -28,6 +28,7 @@ Response 200:
   "minimum_version": "1.0.0", "latest_version": "1.0.0" }
 ```
 Called at start and after any 401 recovery. Also counts as a heartbeat.
+Platforms with round robin add `"long_poll_seconds": 25` for agents from 1.2.0 (see Round robin).
 
 ### GET /api/v1/agent/assignments
 Header `If-None-Match: "<config_version>"` → `304` when unchanged (also a heartbeat).
@@ -55,6 +56,7 @@ Response 200 with `ETag: "<config_version>"`:
 }
 ```
 The agent schedules each check itself every `interval_seconds`, spreading start times with a stable per-check offset (hash of id) so checks don't burst. When assignments change, keep timers for unchanged checks.
+Platforms with round robin add a `schedule` to each check and a `confirm` list (see Round robin); agents before 1.2.0 ignore both.
 
 ### POST /api/v1/agent/results
 Request `{ "results": [ … up to max_batch ] }`, each:
@@ -76,7 +78,7 @@ The agent buffers unsent results in memory (bounded: 10,000; oldest dropped firs
 ## Platform behaviour (for the backend)
 - An agent is **online** if it polled in the last 3 × poll interval (90 s). Own agents going offline alert the workspace (in-app + email, once, and on recovery).
 - A monitor runs from 1+ locations (platform regions and/or own agents) chosen by the workspace. The built-in checker (in the API cluster, Frankfurt) remains a location ("Frankfurt (built-in)") so nothing changes until agents exist.
-- **Down decision**: a monitor is down when, within the last check window, failures come from at least `quorum` locations (default: majority of its locations that reported, minimum 1 when it has one location, 2 when it has 2+). One region failing alone is shown as "degraded in <location>" but opens no incident by default.
+- **Down decision**: a monitor is down when, within the last check window, failures come from at least `quorum` locations (default: majority of its locations that reported, minimum 1 when it has one location, 2 when it has 2+). One region failing alone is shown as "degraded in <location>" but opens no incident by default. With round robin the windows change; see "Platform behaviour (round robin)".
 - Results go to ClickHouse `monitor_checks` with `location` (region code or agent id) through the existing pipeline.
 
 ## Configuration (agent)
@@ -195,3 +197,67 @@ The reference agent sends every field below with every result from 1.1.0 on; a v
   failures always include the response headers and, unless `capture_body` is `false`, the body sample.
 - **Buffering.** The agent's buffer of unsent results is bounded by count (10,000) and by size (64 MiB of JSON). Over the size
   budget it drops body samples from the oldest buffered results first, then whole results, oldest first.
+
+## Round robin (agent 1.2.0)
+Additive, like Check details: the wire version stays `X-Bynh-Agent-Protocol: 1`, agents before 1.2.0 ignore every field
+below and keep checking every `interval_seconds`, and the platform keeps accepting and counting their results.
+
+A monitor checked from N locations is checked once per interval in total instead of N times: its locations take turns
+(A, B, C, D, E, A, …), and a failure is confirmed at once by the next locations.
+
+### `schedule` (assignments, per check)
+```json
+"schedule": { "every_seconds": 300, "phase_seconds": 137, "epoch": 0 }
+```
+- The agent runs the check at the wall-clock times `t` (UTC Unix seconds) where `(t − epoch − phase_seconds) mod every_seconds == 0`,
+  plus a fixed jitter of at most 2 s derived from the check id (the reference agent: FNV-1a 64 of the id, mod
+  min(2000, every_seconds × 500) ms). The jitter is the same on every agent, so turns stay exactly one interval apart.
+- The platform sends `every_seconds = interval_seconds × N` and `phase_seconds = (offset + slot × interval_seconds) mod every_seconds`,
+  where N is the number of the monitor's locations that can check now (the built-in checker; a platform region or own agent
+  while its agent is online), `slot` the location's index among them sorted by location key, and `offset = crc32("mon_<id>") mod interval_seconds`
+  (it spreads monitors over the interval). With one location: `every_seconds = interval_seconds`. `epoch` is 0 (reserved).
+- It changes, with the config version, when N or the order changes (a location added, removed, offline, back). The agent picks the
+  new schedule up without restarting the check's timer: it never runs the same slot twice and never runs two scheduled checks
+  less than half an interval apart; a turn that moved closer runs there, so there is no gap.
+- The agent clamps `every_seconds` to `interval_seconds`–604,800 (a week). A missing or malformed `schedule` means the 1.1.0 behaviour (every
+  `interval_seconds` at the stable offset). Agents rely on an NTP-synced clock; the reference agent re-reads it at least every minute.
+
+### `confirm` (assignments, top level)
+```json
+"confirm": [{ "check_id": "mon_123", "requested_at": "2026-10-03T05:00:02.000Z", "nonce": "Zt7…32 chars" }]
+```
+- Sent to agents from 1.2.0 only: checks this agent's location is asked to run once, now, because another location just saw
+  the monitor fail (or answer while it was down). The list is part of the config version, so a new request changes the ETag.
+- The agent runs each request once, straight away (also right after a scheduled run), and reports the result with
+  `confirm_nonce`. It remembers nonces for at least 15 minutes and runs a nonce once; it runs at most one confirmation per check
+  per 10 s (others are dropped); a request for a check not in `checks` is ignored. At most 1,000 requests are read; `nonce` is
+  1–64 characters `[A-Za-z0-9_-]`, `check_id` a printable id; a malformed request is skipped on its own.
+- The platform lists a request until the result with its nonce arrives or 2 minutes pass.
+
+### `confirm_nonce` (results, per result)
+`"confirm_nonce": "Zt7…"`: only on a result that answers a confirmation request; absent otherwise. A result with a malformed
+nonce is accepted as a scheduled one.
+
+### Long-poll
+- `GET /api/v1/agent/assignments?wait=N` (N ≤ `long_poll_seconds` from hello; the agent sends it only when hello offers it).
+  While the answer would be `304`, the platform may hold the request up to N seconds and answers as soon as the agent's
+  assignments change (for instance a confirmation request). It may also answer `304` at once (it holds only a few requests at a
+  time). The agent's request timeout is at least N + 15 s.
+- The agent polls again straight away (after 250 ms) after a `200` or a held `304`, and after `poll_interval_seconds` when a
+  `304` came back in less than half of N. Agents from 1.2.0 get `poll_interval_seconds: 15`.
+- Results and polls run side by side: a held poll never delays reporting.
+
+### Platform behaviour (round robin)
+- **Reporting**: a location counts while its latest result is younger than `max(2 × interval, interval × locations) + 60 s`
+  (one full turn of the rotation and a minute).
+- **Quorum**: a majority of the reporting locations or of the rotation, whichever is more, at least 2 once there are 2 or more.
+- **Down** when at least `quorum` locations' latest results are failures from the last `2 × interval + 60 s`. A failure (or an
+  answer while down) asks the next `quorum − 1` locations in the rotation (at least 1), skipping offline and paused ones;
+  the built-in checker is asked through its queue. Confirmations never ask for more. One round per monitor per half interval.
+- **Degraded in <location>**: the monitor isn't down and a reporting location's latest result is a failure. No incident.
+- **Up again** by the same rule: once the location whose turn it is and the confirmations its answer triggers leave fewer than
+  `quorum` locations failing.
+- **Uptime**: for monitors with several locations each check counts for the time it covers (since the monitor's previous check,
+  at least 1 s, at most one interval), so uptime stays right whether locations take turns, check every interval (agents before
+  1.2.0) or answer a burst of confirmations. Monitors with one location are unchanged.
+

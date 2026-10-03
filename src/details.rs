@@ -803,6 +803,7 @@ mod tests {
             remote_ip: None,
             response_bytes: Some(1),
             details: Some(details),
+            confirm_nonce: None,
         }
     }
 

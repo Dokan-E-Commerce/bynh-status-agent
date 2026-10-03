@@ -2,6 +2,8 @@
 //! the protocol's handling of 401, 426, 429 and 5xx, and a final flush on
 //! shutdown.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,6 +67,8 @@ struct Session {
     poll: Duration,
     report: Duration,
     max_batch: usize,
+    /// Long-poll wait in seconds (round robin, 1.2.0), when the platform offers it.
+    long_poll: Option<u64>,
 }
 
 impl Session {
@@ -73,7 +77,37 @@ impl Session {
             poll: Duration::from_secs(h.poll_interval_seconds.clamp(1, 3600)),
             report: Duration::from_secs(h.report_interval_seconds.clamp(1, 3600)),
             max_batch: h.max_batch.clamp(1, 10_000),
+            long_poll: h
+                .long_poll_seconds
+                .filter(|w| *w > 0)
+                .map(|w| w.min(crate::protocol::limits::MAX_LONG_POLL_SECONDS)),
         }
+    }
+
+    /// When to poll again after a successful poll that took `took`. With long-poll, straight
+    /// away after a change or a held request (the next one waits on the platform); after a 304
+    /// that came back fast (the platform didn't hold it), the poll interval.
+    fn next_poll(&self, changed: bool, took: Duration) -> Duration {
+        match self.long_poll {
+            Some(w) if changed || took >= Duration::from_secs(w) / 2 => LONG_POLL_GAP,
+            _ => self.poll,
+        }
+    }
+}
+
+/// Pause between two long polls.
+const LONG_POLL_GAP: Duration = Duration::from_millis(250);
+
+type PollFuture =
+    Pin<Box<dyn Future<Output = (Result<AssignmentsOutcome, ApiError>, Instant)> + Send>>;
+
+/// Awaits the poll in flight, or never when there is none.
+async fn in_flight(
+    poll: &mut Option<PollFuture>,
+) -> (Result<AssignmentsOutcome, ApiError>, Instant) {
+    match poll {
+        Some(f) => f.await,
+        None => std::future::pending().await,
     }
 }
 
@@ -89,7 +123,7 @@ enum SessionEnd {
 pub struct Agent {
     config: Config,
     tun: Tunables,
-    client: PlatformClient,
+    client: Arc<PlatformClient>,
     buffer: Arc<ResultBuffer>,
     scheduler: Scheduler<Prober>,
     started_at: OffsetDateTime,
@@ -123,8 +157,10 @@ impl Agent {
             tun.buffer_max_bytes,
         ));
         let scheduler = Scheduler::new(prober, buffer.clone(), config.concurrency);
-        let client = PlatformClient::new(net, &config.api_url, &token, tun.request_timeout)
-            .with_proxy(config.proxy.clone());
+        let client = Arc::new(
+            PlatformClient::new(net, &config.api_url, &token, tun.request_timeout)
+                .with_proxy(config.proxy.clone()),
+        );
         Ok(Self {
             config,
             tun,
@@ -269,6 +305,7 @@ impl Agent {
             poll_interval = ?s.poll,
             report_interval = ?s.report,
             max_batch = s.max_batch,
+            long_poll = ?s.long_poll,
             "connected to bynh"
         );
         if let Some(latest) = hello.latest_version.as_deref() {
@@ -292,20 +329,28 @@ impl Agent {
         let mut report_backoff = Backoff::new(self.tun.backoff_base, self.tun.backoff_cap);
         let mut next_poll = Instant::now();
         let mut next_report = Instant::now() + s.report;
+        // The poll runs alongside reporting: a long poll may wait up to its wait.
+        let mut polling: Option<PollFuture> = None;
 
         loop {
             tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => return SessionEnd::Shutdown,
-                _ = sleep_until(next_poll) => {
-                    let r = tokio::select! {
-                        _ = shutdown.cancelled() => return SessionEnd::Shutdown,
-                        r = self.poll() => r,
-                    };
-                    match r {
-                        Ok(()) => {
+                _ = sleep_until(next_poll), if polling.is_none() => {
+                    let client = self.client.clone();
+                    let etag = self.etag.clone();
+                    let wait = s.long_poll;
+                    polling = Some(Box::pin(async move {
+                        let started = Instant::now();
+                        (client.assignments(etag.as_deref(), wait).await, started)
+                    }));
+                }
+                (r, started) = in_flight(&mut polling) => {
+                    polling = None;
+                    match r.map(|outcome| self.apply_assignments(outcome)) {
+                        Ok(changed) => {
                             poll_backoff.reset();
-                            next_poll = Instant::now() + s.poll;
+                            next_poll = Instant::now() + s.next_poll(changed, started.elapsed());
                         }
                         Err(e) => match fatal(e) {
                             Ok(end) => return end,
@@ -346,10 +391,13 @@ impl Agent {
         }
     }
 
-    async fn poll(&mut self) -> Result<(), ApiError> {
-        match self.client.assignments(self.etag.as_deref()).await? {
+    /// Applies a poll's answer: the checks, then any confirmation requests. Returns whether the
+    /// assignments changed (a 200).
+    fn apply_assignments(&mut self, outcome: AssignmentsOutcome) -> bool {
+        match outcome {
             AssignmentsOutcome::NotModified => {
                 tracing::debug!("assignments unchanged");
+                false
             }
             AssignmentsOutcome::Changed { assignments, etag } => {
                 for (id, reason) in &assignments.skipped {
@@ -368,19 +416,33 @@ impl Agent {
                 }
                 let version = assignments.config_version.clone();
                 let stats = self.scheduler.apply(assignments.checks);
-                tracing::info!(
-                    config_version = %version,
-                    checks = self.scheduler.len(),
-                    added = stats.added,
-                    changed = stats.changed,
-                    removed = stats.removed,
-                    unchanged = stats.unchanged,
-                    "assignments updated"
-                );
+                if stats.added + stats.changed + stats.removed > 0 {
+                    tracing::info!(
+                        config_version = %version,
+                        checks = self.scheduler.len(),
+                        added = stats.added,
+                        changed = stats.changed,
+                        removed = stats.removed,
+                        unchanged = stats.unchanged,
+                        "assignments updated"
+                    );
+                } else {
+                    tracing::debug!(config_version = %version, "assignments version changed; checks unchanged");
+                }
+                if !assignments.confirm.is_empty() {
+                    let c = self.scheduler.confirm(&assignments.confirm);
+                    tracing::debug!(
+                        run = c.run,
+                        duplicate = c.duplicate,
+                        unknown = c.unknown,
+                        rate_limited = c.limited,
+                        "confirmation requests"
+                    );
+                }
                 self.etag = Some(etag);
+                true
             }
         }
-        Ok(())
     }
 
     /// Sends up to `max_batches` batches. Results leave the buffer only once

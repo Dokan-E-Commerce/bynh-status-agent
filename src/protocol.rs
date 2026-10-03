@@ -31,6 +31,13 @@ pub mod limits {
     pub const MAX_INTERVAL_SECONDS: u64 = 86_400;
     pub const MAX_TIMEOUT_MS: u64 = 120_000;
     pub const MAX_REDIRECTS: u32 = 20;
+    /// Longest round-robin turn (`schedule.every_seconds`): a week.
+    pub const MAX_EVERY_SECONDS: u64 = 7 * 86_400;
+    /// Confirmation requests read from one assignments response.
+    pub const MAX_CONFIRM: usize = 1_000;
+    pub const MAX_NONCE: usize = 64;
+    /// Longest long-poll wait the agent asks for.
+    pub const MAX_LONG_POLL_SECONDS: u64 = 60;
 }
 
 /// Version of this agent build.
@@ -81,6 +88,20 @@ pub struct HelloResponse {
     pub minimum_version: Option<String>,
     #[serde(default)]
     pub latest_version: Option<String>,
+    /// Round robin (1.2.0): how long the platform may hold a poll (`?wait=`); absent or 0: never.
+    #[serde(default, deserialize_with = "lenient")]
+    pub long_poll_seconds: Option<u64>,
+}
+
+/// Reads an optional field, treating a value of the wrong shape like a missing one, so a newer
+/// or broken platform can't take the whole document down with it.
+fn lenient<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(v.and_then(|v| serde_json::from_value(v).ok()))
 }
 
 fn default_poll() -> u64 {
@@ -125,12 +146,38 @@ struct RawAssignments {
     config_version: String,
     #[serde(default, deserialize_with = "null_default")]
     checks: Vec<serde_json::Value>,
+    #[serde(default, deserialize_with = "null_default")]
+    confirm: Vec<serde_json::Value>,
+}
+
+/// A confirmation request (round robin, 1.2.0): run this check once, now, and report the result
+/// with `confirm_nonce`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ConfirmRequest {
+    pub check_id: String,
+    #[serde(default)]
+    pub requested_at: Option<String>,
+    pub nonce: String,
+}
+
+impl ConfirmRequest {
+    fn valid(&self) -> bool {
+        printable_id(&self.check_id)
+            && !self.nonce.is_empty()
+            && self.nonce.len() <= limits::MAX_NONCE
+            && self
+                .nonce
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Assignments {
     pub config_version: String,
     pub checks: Vec<Check>,
+    /// Confirmation requests (absent before platform round robin: empty).
+    pub confirm: Vec<ConfirmRequest>,
     /// Checks that could not be understood: (id if printable, reason). The
     /// reason is a fixed category and never contains values from the check.
     pub skipped: Vec<(Option<String>, &'static str)>,
@@ -166,9 +213,18 @@ impl Assignments {
                 Err(_) => skipped.push((id, "invalid field types")),
             }
         }
+        // Malformed requests are dropped one by one, like checks.
+        let confirm = raw
+            .confirm
+            .into_iter()
+            .take(limits::MAX_CONFIRM)
+            .filter_map(|v| serde_json::from_value::<ConfirmRequest>(v).ok())
+            .filter(ConfirmRequest::valid)
+            .collect();
         Ok(Self {
             config_version: raw.config_version,
             checks,
+            confirm,
             skipped,
             truncated: total.saturating_sub(limits::MAX_CHECKS),
         })
@@ -212,8 +268,31 @@ impl fmt::Debug for Auth {
     }
 }
 
-/// One assigned check. `PartialEq` is used to decide whether a timer can be kept
-/// when the assignment set changes.
+/// When this agent runs a check (round robin, 1.2.0): at the wall-clock times `t` (UTC Unix
+/// seconds) where `(t − epoch − phase_seconds) mod every_seconds == 0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Schedule {
+    pub every_seconds: u64,
+    #[serde(default)]
+    pub phase_seconds: u64,
+    #[serde(default)]
+    pub epoch: i64,
+}
+
+impl Schedule {
+    /// Clamps `every_seconds` to the check's interval – a week, whatever the platform sent: a turn
+    /// is never shorter than the interval (it is the interval times the number of locations).
+    pub fn normalized(self, interval_seconds: u64) -> Self {
+        let min = interval_seconds.clamp(1, limits::MAX_EVERY_SECONDS);
+        Self {
+            every_seconds: self.every_seconds.clamp(min, limits::MAX_EVERY_SECONDS),
+            ..self
+        }
+    }
+}
+
+/// One assigned check. `PartialEq` is used to decide whether a timer must
+/// pick up a new definition when the assignment set changes.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct Check {
     pub id: String,
@@ -254,6 +333,10 @@ pub struct Check {
     /// Send a body sample with the result's details (default true).
     #[serde(default = "default_true", deserialize_with = "bool_or_true")]
     pub capture_body: bool,
+    /// Round robin (1.2.0): when to run; absent (older platform) or malformed: every
+    /// `interval_seconds` at the check's own offset.
+    #[serde(default, deserialize_with = "lenient")]
+    pub schedule: Option<Schedule>,
 }
 
 fn default_method() -> String {
@@ -301,6 +384,7 @@ impl fmt::Debug for Check {
             .field("verify_tls", &self.verify_tls)
             .field("ip_version", &self.ip_version)
             .field("capture_body", &self.capture_body)
+            .field("schedule", &self.schedule)
             .finish()
     }
 }
@@ -329,6 +413,8 @@ impl Check {
         self.interval_seconds = self.interval_seconds.clamp(1, MAX_INTERVAL_SECONDS);
         self.timeout_ms = self.timeout_ms.clamp(1, MAX_TIMEOUT_MS);
         self.max_redirects = self.max_redirects.min(MAX_REDIRECTS);
+        let interval = self.interval_seconds;
+        self.schedule = self.schedule.map(|s| s.normalized(interval));
         if let Some(u) = &self.url {
             if u.len() > MAX_URL {
                 return Err("url too long");
@@ -400,6 +486,7 @@ impl Check {
             verify_tls: true,
             ip_version: IpVersion::Any,
             capture_body: true,
+            schedule: None,
         }
     }
 }
@@ -476,6 +563,10 @@ pub struct CheckResult {
     /// prober.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<crate::details::Details>,
+    /// Round robin (1.2.0): the nonce of the confirmation request this result answers. Only on
+    /// confirmation results.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirm_nonce: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -704,6 +795,115 @@ mod tests {
     fn rfc3339_millis() {
         let t = time::macros::datetime!(2026-10-03 05:00:00.123456 UTC);
         assert_eq!(rfc3339(t), "2026-10-03T05:00:00.123Z");
+    }
+
+    #[test]
+    fn schedule_is_read_and_clamped_and_a_bad_one_ignored() {
+        use serde_json::json;
+        let a = parse_one(
+            json!({ "schedule": { "every_seconds": 300, "phase_seconds": 137, "epoch": 0 } }),
+        );
+        assert_eq!(
+            a.checks[0].schedule,
+            Some(Schedule {
+                every_seconds: 300,
+                phase_seconds: 137,
+                epoch: 0
+            })
+        );
+        let a = parse_one(json!({ "schedule": { "every_seconds": u64::MAX } }));
+        let sch = a.checks[0].schedule.unwrap();
+        assert_eq!(sch.every_seconds, limits::MAX_EVERY_SECONDS);
+        assert_eq!((sch.phase_seconds, sch.epoch), (0, 0));
+        // Never shorter than the interval (60 s by default here).
+        let a = parse_one(json!({ "schedule": { "every_seconds": 0 } }));
+        assert_eq!(a.checks[0].schedule.unwrap().every_seconds, 60);
+        for bad in [
+            json!(null),
+            json!("soon"),
+            json!({ "every_seconds": "300" }),
+            json!({ "phase_seconds": 1 }),
+            json!({ "every_seconds": -5 }),
+        ] {
+            let a = parse_one(json!({ "schedule": bad }));
+            assert_eq!(a.checks.len(), 1, "a bad schedule never drops the check");
+            assert_eq!(a.checks[0].schedule, None, "{bad}");
+        }
+        assert_eq!(parse_one(json!({})).checks[0].schedule, None);
+    }
+
+    #[test]
+    fn confirmation_requests_are_read_one_by_one() {
+        let doc = serde_json::json!({ "config_version": "c", "checks": [], "confirm": [
+            { "check_id": "mon_1", "requested_at": "2026-10-03T05:00:02.000Z", "nonce": "Zt7abc_-9" },
+            { "check_id": "mon_2", "nonce": "n2" },
+            { "check_id": "mon 3", "nonce": "n3" },
+            { "check_id": "mon_4", "nonce": "bad nonce" },
+            { "check_id": "mon_5", "nonce": "x".repeat(65) },
+            { "check_id": "mon_6" },
+            "junk"
+        ] });
+        let a = Assignments::parse(&serde_json::to_vec(&doc).unwrap()).unwrap();
+        let got: Vec<_> = a
+            .confirm
+            .iter()
+            .map(|c| (c.check_id.as_str(), c.nonce.as_str()))
+            .collect();
+        assert_eq!(got, [("mon_1", "Zt7abc_-9"), ("mon_2", "n2")]);
+        assert_eq!(
+            a.confirm[0].requested_at.as_deref(),
+            Some("2026-10-03T05:00:02.000Z")
+        );
+
+        let many: Vec<_> = (0..limits::MAX_CONFIRM + 5)
+            .map(|i| serde_json::json!({ "check_id": "mon_1", "nonce": format!("n{i}") }))
+            .collect();
+        let doc = serde_json::json!({ "config_version": "c", "confirm": many });
+        let a = Assignments::parse(&serde_json::to_vec(&doc).unwrap()).unwrap();
+        assert_eq!(a.confirm.len(), limits::MAX_CONFIRM);
+        let none =
+            Assignments::parse(br#"{ "config_version": "c", "checks": [], "confirm": null }"#)
+                .unwrap();
+        assert!(none.confirm.is_empty());
+    }
+
+    #[test]
+    fn hello_long_poll_is_optional() {
+        let base = serde_json::json!({ "agent": { "id": "agt_1" } });
+        let h: HelloResponse = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(h.long_poll_seconds, None);
+        let mut v = base.clone();
+        v["long_poll_seconds"] = serde_json::json!(25);
+        let h: HelloResponse = serde_json::from_value(v).unwrap();
+        assert_eq!(h.long_poll_seconds, Some(25));
+        let mut v = base;
+        v["long_poll_seconds"] = serde_json::json!("forever");
+        let h: HelloResponse = serde_json::from_value(v).unwrap();
+        assert_eq!(h.long_poll_seconds, None);
+    }
+
+    #[test]
+    fn confirm_nonce_is_sent_only_on_confirmations() {
+        let mut r = CheckResult {
+            check_id: "mon_1".into(),
+            started_at: "2026-10-03T05:00:00.000Z".into(),
+            duration_ms: 1,
+            ok: true,
+            status_code: None,
+            error: None,
+            timings: None,
+            tls_expires_at: None,
+            remote_ip: None,
+            response_bytes: None,
+            details: None,
+            confirm_nonce: None,
+        };
+        assert!(serde_json::to_value(&r)
+            .unwrap()
+            .get("confirm_nonce")
+            .is_none());
+        r.confirm_nonce = Some("n1".into());
+        assert_eq!(serde_json::to_value(&r).unwrap()["confirm_nonce"], "n1");
     }
 
     #[test]

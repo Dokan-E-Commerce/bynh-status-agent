@@ -215,6 +215,7 @@ mod tests {
             remote_ip: None,
             response_bytes: None,
             details: None,
+            confirm_nonce: None,
         }
     }
 

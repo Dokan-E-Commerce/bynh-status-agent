@@ -262,8 +262,8 @@ report_ip = true
 concurrency = 64
 ```
 
-How often to poll, how often to report and how big a batch may be come from the platform in the
-`hello` response.
+How often to poll, how often to report, how big a batch may be and whether to long-poll come from
+the platform in the `hello` response.
 
 ### Outbound proxies
 
@@ -322,10 +322,10 @@ Only what the protocol defines, to the `api_url` you configure:
 
 - **`hello`** at start: agent version, OS, CPU architecture, the start time and, unless
   `send_hostname = false`, the hostname.
-- **Assignment polls**: no body.
+- **Assignment polls**: no body (with round robin, a `wait` query parameter for the long poll).
 - **Check results**: check id, start time, duration, pass or fail, status code, error kind and a short
   message, phase timings, certificate expiry, bytes read, and the IP connected to (unless
-  `report_ip = false`), plus the **check details** below.
+  `report_ip = false`), plus the **check details** below, and on a confirmation the request’s nonce.
 
 ### Check details
 
@@ -478,9 +478,17 @@ machines you run them on, so allow those instead.
 - **Timings** are per phase, for the final request: `dns_ms` (0 for an IP address), `connect_ms`,
   `tls_ms`, and `ttfb_ms` (from sending the request to the response headers). Phases that didn’t
   happen are `null`. `duration_ms` covers the whole check, redirects included.
-- **Scheduling**: every check runs every `interval_seconds` at a fixed offset derived from its id, so
-  checks are spread out and keep their rhythm across restarts. When assignments change, untouched
-  checks keep their timers.
+- **Scheduling (round robin, 1.2.0)**: a monitor checked from several places is checked once per
+  interval in total, its places taking turns. The platform gives each check a wall-clock `schedule`
+  (this agent’s turn) and the agent runs it then, plus a fixed jitter of under 2 s from the check’s id,
+  so the agent needs an NTP-synced clock. When the turns change (a place added, removed, offline or
+  back) the running timer picks up the new schedule without double runs or gaps. A platform without
+  round robin sends no schedule: then every check runs every `interval_seconds` at a fixed offset
+  derived from its id, as before. Untouched checks keep their timers when assignments change.
+- **Confirmations**: when one place sees a monitor fail, the platform asks the next places to check it
+  right away. The agent runs each request once, at most one per check every 10 s, and marks the
+  result with the request’s nonce. With round robin it waits on the platform with a long poll
+  (`?wait=`), so a request reaches it within a second or two, while results keep flowing.
 - **IP version**: `any` prefers IPv4 when a host has both; `4` and `6` force one family.
 
 ## Resource use

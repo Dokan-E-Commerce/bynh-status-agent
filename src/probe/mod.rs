@@ -164,6 +164,7 @@ impl Prober {
             },
             response_bytes: out.response_bytes,
             details: Some(details),
+            confirm_nonce: None,
         };
         details::fit_budget(&mut result, details::MAX_RESULT_BYTES);
         result

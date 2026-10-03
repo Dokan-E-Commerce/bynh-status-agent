@@ -6,6 +6,31 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [1.2.0] – not yet released
+
+### Added
+
+- Round robin (protocol v1, additive; see “Round robin” in `PROTOCOL.md`): a check with a `schedule`
+  runs at the wall-clock times `t` where `(t − epoch − phase_seconds) mod every_seconds == 0`, plus a
+  fixed jitter of under 2 s from its id, so a monitor’s places take turns and it is checked once per
+  interval in total. Without a `schedule` (an older platform) checks run every `interval_seconds` as
+  before.
+- Confirmation requests: the assignments’ `confirm` list asks the agent to run a check once, straight
+  away; the result carries `confirm_nonce`. Each nonce runs once (remembered for 15 minutes), at most
+  one confirmation per check every 10 s, requests for unassigned checks are ignored.
+- Long-poll: when `hello` offers `long_poll_seconds`, assignment polls ask the platform to hold them
+  (`?wait=N`, request timeout N + 15 s) and the agent polls again straight away after a change or a
+  held answer, or after the poll interval when the platform answered at once. Polls run alongside
+  result reports, so a held poll never delays them.
+
+### Changed
+
+- A check whose definition or schedule changes keeps its timer: the running timer picks up the change
+  instead of restarting, never runs the same slot twice and never runs two scheduled checks less than
+  half an interval apart. A check in flight is no longer cut off by an assignment change.
+- Timers re-read the wall clock at least every minute, so a clock correction is picked up.
+- “assignments updated” is logged only when checks were added, changed or removed.
+
 ## [1.1.0] – not yet released
 
 ### Added

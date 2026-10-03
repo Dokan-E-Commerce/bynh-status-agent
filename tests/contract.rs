@@ -246,3 +246,126 @@ fn redaction_list_matches() {
         "PROTOCOL.md lists names the agent doesn't (+2: the placeholder and the monitor's `auth`): {rules}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Round robin (agent 1.2.0)
+
+use bynh_status_agent::protocol::{limits, Assignments, CheckResult, HelloResponse, Schedule};
+use bynh_status_agent::scheduler::{CONFIRM_MIN_GAP, MAX_JITTER_MS, NONCE_MEMORY};
+
+fn round_robin_section() -> &'static str {
+    PROTOCOL_LF
+        .split("## Round robin (agent 1.2.0)\n")
+        .nth(1)
+        .expect("PROTOCOL.md has a Round robin section")
+}
+
+/// The first ```json block after `heading` in the Round robin section.
+fn rr_block(heading: &str) -> &'static str {
+    let section = round_robin_section();
+    let at = section
+        .find(heading)
+        .unwrap_or_else(|| panic!("no {heading}"));
+    let rest = &section[at..];
+    let start = rest.find("```json\n").expect("example") + "```json\n".len();
+    &rest[start..start + rest[start..].find("```").unwrap()]
+}
+
+#[test]
+fn schedule_fields_match() {
+    let block = rr_block("### `schedule`");
+    let doc = documented_keys(block);
+    let mut ser = std::collections::BTreeSet::new();
+    let schedule = Schedule {
+        every_seconds: 300,
+        phase_seconds: 137,
+        epoch: 0,
+    };
+    serialised_keys(
+        &serde_json::json!({ "schedule": serde_json::to_value(schedule).unwrap() }),
+        &mut ser,
+    );
+    assert_eq!(doc, ser);
+    // The example parses as a check's schedule.
+    let check = format!(
+        r#"{{ "config_version": "c", "checks": [{{ "id": "mon_1", "type": "http", "url": "https://example.com/", {} }}] }}"#,
+        block.trim()
+    );
+    let a = Assignments::parse(check.as_bytes()).unwrap();
+    assert_eq!(a.checks[0].schedule, Some(schedule));
+    let section = round_robin_section();
+    assert!(section.contains("`(t − epoch − phase_seconds) mod every_seconds == 0`"));
+    assert!(section.contains(&format!("at most {} s", MAX_JITTER_MS / 1000)));
+    assert!(section.contains(&format!(
+        "`interval_seconds`–{} (a week)",
+        group(limits::MAX_EVERY_SECONDS)
+    )));
+}
+
+#[test]
+fn confirm_fields_match() {
+    let block = rr_block("### `confirm`");
+    assert_eq!(
+        documented_keys(block),
+        ["check_id", "confirm", "nonce", "requested_at"]
+            .map(String::from)
+            .into()
+    );
+    let doc = format!(r#"{{ "config_version": "c", {} }}"#, block.trim());
+    let a = Assignments::parse(doc.replace("…32 chars", "").as_bytes()).unwrap();
+    assert_eq!(a.confirm.len(), 1);
+    assert_eq!(a.confirm[0].check_id, "mon_123");
+
+    let section = round_robin_section();
+    assert!(section.contains(&format!("at least {} minutes", NONCE_MEMORY.as_secs() / 60)));
+    assert!(section.contains(&format!("per check\n  per {} s", CONFIRM_MIN_GAP.as_secs())));
+    assert!(section.contains(&format!(
+        "At most {} requests",
+        group(limits::MAX_CONFIRM as u64)
+    )));
+    assert!(section.contains(&format!("`nonce` is\n  1–{} characters", limits::MAX_NONCE)));
+}
+
+#[test]
+fn confirm_nonce_and_long_poll_match() {
+    assert!(line_with("### `confirm_nonce`").contains("(results, per result)"));
+    assert!(round_robin_section().contains("`\"confirm_nonce\": \"Zt7…\"`"));
+    let r = CheckResult {
+        check_id: "mon_1".into(),
+        started_at: "2026-10-03T05:00:00.000Z".into(),
+        duration_ms: 1,
+        ok: true,
+        status_code: None,
+        error: None,
+        timings: None,
+        tls_expires_at: None,
+        remote_ip: None,
+        response_bytes: None,
+        details: None,
+        confirm_nonce: Some("Zt7".into()),
+    };
+    assert_eq!(serde_json::to_value(&r).unwrap()["confirm_nonce"], "Zt7");
+
+    assert!(PROTOCOL_LF.contains("`\"long_poll_seconds\": 25`"));
+    assert!(PROTOCOL_LF.contains(&format!("`GET {PATH_ASSIGNMENTS}?wait=N`")));
+    let h: HelloResponse =
+        serde_json::from_str(r#"{ "agent": { "id": "agt_1" }, "long_poll_seconds": 25 }"#).unwrap();
+    assert_eq!(h.long_poll_seconds, Some(25));
+    assert!(round_robin_section().contains(&format!(
+        "at least N + {} s",
+        bynh_status_agent::platform::LONG_POLL_MARGIN_SECS
+    )));
+}
+
+/// 604800 → "604,800".
+fn group(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
