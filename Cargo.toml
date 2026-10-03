@@ -1,0 +1,53 @@
+[package]
+name = "bynh-status-agent"
+version = "1.0.0"
+edition = "2021"
+description = "Open-source uptime monitoring agent for bynh: runs HTTP, keyword, TCP and TLS checks and reports results to the platform."
+license = "Apache-2.0"
+repository = "https://github.com/Dokan-E-Commerce/bynh-status-agent"
+homepage = "https://bynh.io"
+readme = "README.md"
+keywords = ["uptime", "monitoring", "status-page", "agent", "probe"]
+categories = ["command-line-utilities", "network-programming"]
+publish = false
+
+[dependencies]
+base64 = "0.23.1"
+bytes = "1.12.1"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+fastrand = "2.5.0"
+flate2 = "1.1.10"
+gethostname = "1.1.0"
+hickory-resolver = { version = "0.26.3", default-features = false, features = ["tokio", "system-config"] }
+http = "1.5.0"
+http-body-util = "0.1.5"
+httpdate = "1.0.3"
+hyper = { version = "1.11.1", features = ["client", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+memchr = "2.8.3"
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+time = { version = "0.3.55", features = ["formatting", "parsing", "macros"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "io-util"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+tokio-util = "0.7.19"
+toml = "1.1.6"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json", "fmt"] }
+url = "2.5.8"
+webpki-roots = "1.0.9"
+x509-parser = "0.18.1"
+
+[dev-dependencies]
+axum = "0.8.9"
+rcgen = "0.14.10"
+tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["test-util"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+opt-level = 3
