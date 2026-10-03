@@ -86,3 +86,19 @@ allow_private = false   # true for on-premise agents checking internal hosts
 report_ip = true
 concurrency = 64
 ```
+
+## Clarifications (v1)
+Additive notes on behaviour the sections above leave open. They don't change the wire format; the reference agent (`bynh-status-agent`) behaves exactly like this.
+
+1. **Timings.** Each field of `timings` is a number or `null`. A phase that didn't happen is `null`: `tls_ms` for plain HTTP and TCP checks, `ttfb_ms` for TCP and TLS checks. `dns_ms` is `0` when the target is an IP address. `timings` itself is `null` only when no phase completed. `ttfb_ms` runs from sending the request to receiving the response headers. When a check goes through an outbound proxy (`check_via_proxy`), `dns_ms` and `connect_ms` describe the connection to the proxy (tunnel setup included in `connect_ms`) and `remote_ip` is `null`.
+2. **`response_bytes`.** The number of response body bytes the agent read, at most 1 MiB (1,048,576); the rest of a larger body is not read. `0` for `HEAD` and empty bodies, `null` for TCP and TLS checks.
+3. **Redirects.** `status_code`, `timings`, `remote_ip` and `tls_expires_at` describe the final request (the one judged against `expected_statuses`). `duration_ms` covers the whole check, redirects included.
+4. **Expected statuses.** An empty `expected_statuses`, or one with no valid entry, means any `2xx`. Entries are `Nxx` classes (case-insensitive) or exact codes; invalid entries are ignored.
+5. **IP version.** With `ip_version: "any"`, a host that has both A and AAAA records is checked over IPv4.
+6. **Bounds.** The agent treats `interval_seconds` below 1 as 1 and caps `timeout_ms` at 120,000.
+7. **Unknown checks.** A check the agent can't parse (for example an unknown `type`) is skipped and logged; the rest of the assignment set still runs. No results are sent for it.
+8. **Redirect rules.** Up to `max_redirects` redirects (301, 302, 303, 307, 308 with a `Location`) are followed; more is the error kind `redirects`. A 303 always continues as `GET` (a `HEAD` stays `HEAD`), and a 301 or 302 after a `POST` continues as `GET`; both drop the body. 307 and 308 keep the method and body. Each hop is resolved and checked against the private-address rules again. `Authorization`, `Proxy-Authorization` and `Cookie` are dropped once a redirect leaves the original origin (scheme, host and port).
+9. **Refused result batches.** If `POST /results` answers with a 4xx other than 401, 426 or 429, the agent drops that batch (it would block every later result if retried) and logs it. 429 and 5xx keep the batch buffered for retry.
+10. **Hostname.** `hello` includes `hostname` unless the agent is configured with `send_hostname = false`.
+
+The reference agent is named `bynh-status-agent`: its User-Agent is `bynh-status-agent/<version> (<os>; <arch>)` and its config file is `bynh-status-agent.toml` (renamed from `bynh-agent` before the first release).
