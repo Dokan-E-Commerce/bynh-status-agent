@@ -305,3 +305,57 @@ async fn shutdown_flushes_buffered_results() {
     assert!(sent >= buffered, "sent {sent} of {buffered}");
     assert!(buffer.is_empty());
 }
+
+#[tokio::test]
+async fn platform_traffic_uses_the_proxy_and_checks_do_not() {
+    let (platform, mock) = spawn_platform().await;
+    let target = spawn_target().await;
+    let (proxy, log) = common::spawn_proxy(None).await;
+    mock.lock().unwrap().checks = json!([http_check("mon_ok", &format!("http://{target}/ok"))]);
+
+    let config = bynh_status_agent::config::Config {
+        token: Some(TOKEN.into()),
+        api_url: format!("http://{platform}"),
+        allow_private: true,
+        send_hostname: false,
+        proxy: bynh_status_agent::proxy::ProxySettings::resolve(
+            Some(&format!("http://{proxy}")),
+            None,
+            &|_| None,
+        )
+        .unwrap(),
+        ..Default::default()
+    };
+    let agent = bynh_status_agent::agent::Agent::new(config, common::fast_tunables()).unwrap();
+    let shutdown = CancellationToken::new();
+    let run = tokio::spawn(agent.run(shutdown.clone()));
+    assert!(
+        wait_for(&mock, Duration::from_secs(8), |s| !s
+            .results_calls
+            .is_empty())
+        .await
+    );
+    shutdown.cancel();
+    run.await.unwrap();
+
+    let log = log.lock().unwrap().clone();
+    let base = format!("http://{platform}/api/v1/agent");
+    assert!(
+        log.iter()
+            .any(|l| l == &format!("POST {base}/hello HTTP/1.1")),
+        "{log:?}"
+    );
+    assert!(log
+        .iter()
+        .any(|l| l.starts_with(&format!("GET {base}/assignments"))));
+    assert!(log
+        .iter()
+        .any(|l| l.starts_with(&format!("POST {base}/results"))));
+    assert!(
+        !log.iter().any(|l| l.contains("/ok")),
+        "checks went through the proxy: {log:?}"
+    );
+    let s = mock.lock().unwrap();
+    let r = &s.results_calls[0].results[0];
+    assert_eq!(r["remote_ip"], "127.0.0.1");
+}

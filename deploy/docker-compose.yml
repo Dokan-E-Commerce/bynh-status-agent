@@ -14,6 +14,9 @@ services:
       # BYNH_REPORT_IP: "false"
       # BYNH_LOG: "info"
       # BYNH_LOG_FORMAT: "json"
+      # Behind an outbound proxy:
+      # HTTPS_PROXY: "http://proxy.corp:3128"
+      # NO_PROXY: "localhost,.corp.internal"
     read_only: true
     user: "65532:65532"
     cap_drop: [ALL]

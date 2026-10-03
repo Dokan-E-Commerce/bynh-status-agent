@@ -310,3 +310,94 @@ async fn expired_certificate_fails_tls_check() {
     assert!(e.message.contains("expired"), "{}", e.message);
     assert!(r.tls_expires_at.is_some());
 }
+
+fn proxied(url: &str) -> Prober {
+    let settings =
+        bynh_status_agent::proxy::ProxySettings::resolve(Some(url), Some(""), &|_| None).unwrap();
+    Prober::new(Arc::new(Net::new(None).unwrap()), Guard::new(true), true).with_proxy(settings)
+}
+
+#[tokio::test]
+async fn checks_through_a_connect_proxy() {
+    let (proxy, log) = common::spawn_proxy(None).await;
+    let tls = spawn_tls(OffsetDateTime::now_utc() + time::Duration::days(30)).await;
+    let target = spawn_target().await;
+    let p = proxied(&format!("http://{proxy}"));
+
+    // https through a CONNECT tunnel
+    let mut c = http(format!("https://localhost:{}/", tls.port()));
+    c.verify_tls = false;
+    let r = p.run(&c).await;
+    assert!(r.ok, "{r:?}");
+    assert!(r.tls_expires_at.is_some());
+    assert!(
+        r.remote_ip.is_none(),
+        "the target's IP is unknown through a proxy"
+    );
+
+    // plain http in absolute form
+    let r = p.run(&http(format!("http://{target}/ok"))).await;
+    assert!(r.ok, "{r:?}");
+
+    // tcp through a tunnel
+    let mut c = Check::new("mon_tcp", CheckType::Tcp);
+    c.host = Some(LOOPBACK.into());
+    c.port = Some(target.port());
+    assert!(p.run(&c).await.ok);
+
+    let log = log.lock().unwrap().clone();
+    assert!(
+        log.contains(&format!("CONNECT localhost:{} HTTP/1.1", tls.port())),
+        "{log:?}"
+    );
+    assert!(
+        log.contains(&format!("GET http://{target}/ok HTTP/1.1")),
+        "{log:?}"
+    );
+    assert!(
+        log.contains(&format!("CONNECT 127.0.0.1:{} HTTP/1.1", target.port())),
+        "{log:?}"
+    );
+}
+
+#[tokio::test]
+async fn proxy_authentication() {
+    // "user:p@ss" → dXNlcjpwQHNz
+    let (proxy, _) = common::spawn_proxy(Some("Basic dXNlcjpwQHNz")).await;
+    let target = spawn_target().await;
+    let mut c = http(format!(
+        "https://localhost:{}/",
+        spawn_tls(OffsetDateTime::now_utc() + time::Duration::days(30))
+            .await
+            .port()
+    ));
+    c.verify_tls = false;
+
+    let ok = proxied(&format!("http://user:p%40ss@{proxy}"));
+    assert!(ok.run(&c).await.ok);
+    assert!(ok.run(&http(format!("http://{target}/ok"))).await.ok);
+
+    let r = proxied(&format!("http://{proxy}")).run(&c).await;
+    let e = r.error.unwrap();
+    assert_eq!(e.kind, ErrorKind::Connect);
+    assert!(e.message.contains("407"), "{}", e.message);
+    assert!(!e.message.contains("p@ss") && !e.message.contains("p%40ss"));
+}
+
+#[tokio::test]
+async fn no_proxy_connects_directly() {
+    let (proxy, log) = common::spawn_proxy(None).await;
+    let target = spawn_target().await;
+    let settings = bynh_status_agent::proxy::ProxySettings::resolve(
+        Some(&format!("http://{proxy}")),
+        Some("127.0.0.1"),
+        &|_| None,
+    )
+    .unwrap();
+    let p =
+        Prober::new(Arc::new(Net::new(None).unwrap()), Guard::new(true), true).with_proxy(settings);
+    let r = p.run(&http(format!("http://{target}/ok"))).await;
+    assert!(r.ok);
+    assert_eq!(r.remote_ip.as_deref(), Some(LOOPBACK));
+    assert!(log.lock().unwrap().is_empty());
+}

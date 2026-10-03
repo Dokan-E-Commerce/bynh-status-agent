@@ -15,3 +15,8 @@ concurrency = 64
 # log = "info"          # or debug, warn, a filter such as "bynh_status_agent=debug"
 # log_format = "human"  # or json
 # ca_file = "/etc/bynh-status-agent/internal-ca.pem"
+
+# Outbound proxy (http:// only). Without proxy_url, HTTPS_PROXY/HTTP_PROXY/NO_PROXY are used.
+# proxy_url = "http://user:pass@proxy.corp:3128"
+# no_proxy = "localhost, .corp.internal, 10.0.0.0/8"
+# check_via_proxy = false   # true sends checks through the proxy too (requires allow_private = true)

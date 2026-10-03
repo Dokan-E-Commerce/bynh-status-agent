@@ -380,3 +380,88 @@ pub fn ids(results: &[Value]) -> Vec<String> {
         .map(|r| r["check_id"].as_str().unwrap().to_owned())
         .collect()
 }
+
+// ---------------------------------------------------------------------------
+// A tiny forward proxy: CONNECT tunnels and absolute-form HTTP requests.
+
+pub type ProxyLog = Arc<Mutex<Vec<String>>>;
+
+/// Starts a proxy. With `require_auth`, requests must carry
+/// `Proxy-Authorization: <value>` or get a 407. Logs each request line.
+pub async fn spawn_proxy(require_auth: Option<&'static str>) -> (SocketAddr, ProxyLog) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let log: ProxyLog = Arc::new(Mutex::new(Vec::new()));
+    let log2 = log.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut client, _)) = listener.accept().await else {
+                return;
+            };
+            let log = log2.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let end = loop {
+                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                    match client.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                };
+                let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+                let line = head.lines().next().unwrap_or("").to_owned();
+                log.lock().unwrap().push(line.clone());
+                if let Some(expected) = require_auth {
+                    let ok = head.lines().any(|l| {
+                        l.to_ascii_lowercase().starts_with("proxy-authorization:")
+                            && l.split_once(':').unwrap().1.trim() == expected
+                    });
+                    if !ok {
+                        let _ = client
+                            .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n")
+                            .await;
+                        return;
+                    }
+                }
+                let mut parts = line.split_whitespace();
+                let method = parts.next().unwrap_or("");
+                let target = parts.next().unwrap_or("").to_owned();
+                if method == "CONNECT" {
+                    let Ok(mut upstream) =
+                        tokio::net::TcpStream::connect(resolve_local(&target)).await
+                    else {
+                        let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                        return;
+                    };
+                    let _ = client
+                        .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                        .await;
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                } else {
+                    let url = url::Url::parse(&target).unwrap();
+                    let hostport = format!(
+                        "{}:{}",
+                        url.host_str().unwrap(),
+                        url.port_or_known_default().unwrap()
+                    );
+                    let Ok(mut upstream) =
+                        tokio::net::TcpStream::connect(resolve_local(&hostport)).await
+                    else {
+                        return;
+                    };
+                    let _ = upstream.write_all(&buf).await;
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                }
+            });
+        }
+    });
+    (addr, log)
+}
+
+/// The test proxy maps `localhost` to 127.0.0.1.
+fn resolve_local(hostport: &str) -> String {
+    hostport.replace("localhost", "127.0.0.1")
+}

@@ -16,6 +16,7 @@ use crate::protocol::{
     user_agent, Assignments, CheckResult, HelloRequest, HelloResponse, IpVersion, ResultsRequest,
     ResultsResponse, UpgradeRequired, PROTOCOL_VERSION,
 };
+use crate::proxy::ProxySettings;
 
 /// Largest platform response we accept (compressed or not).
 const MAX_RESPONSE: usize = 32 << 20;
@@ -77,6 +78,7 @@ pub struct PlatformClient {
     token: String,
     timeout: Duration,
     guard: Guard,
+    proxy: ProxySettings,
 }
 
 impl PlatformClient {
@@ -89,7 +91,14 @@ impl PlatformClient {
             // The platform address is chosen by the operator, not by the
             // platform, so it may be local (self-hosting, tests).
             guard: Guard::new(true),
+            proxy: ProxySettings::default(),
         }
+    }
+
+    /// Reach the platform through an outbound proxy (unless `no_proxy` matches).
+    pub fn with_proxy(mut self, proxy: ProxySettings) -> Self {
+        self.proxy = proxy;
+        self
     }
 
     pub async fn hello(&self, req: &HelloRequest) -> Result<HelloResponse, ApiError> {
@@ -195,6 +204,7 @@ impl PlatformClient {
                 verify_tls: true,
                 ip_version: IpVersion::Any,
                 guard: &self.guard,
+                proxy: self.proxy.for_url(&url),
                 max_body: MAX_RESPONSE,
             },
             &mut trace,

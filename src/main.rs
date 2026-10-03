@@ -256,11 +256,11 @@ async fn check_once(config: Config, args: CheckArgs) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let prober = Prober::new(
-        net,
-        Guard::new(config.allow_private || args.allow_private),
-        true,
-    );
+    let allow_private = config.allow_private || args.allow_private;
+    let mut prober = Prober::new(net, Guard::new(allow_private), true);
+    if config.check_via_proxy && allow_private {
+        prober = prober.with_proxy(config.proxy.clone());
+    }
     let result = prober.run(&check).await;
     match serde_json::to_string_pretty(&result) {
         Ok(s) => println!("{s}"),

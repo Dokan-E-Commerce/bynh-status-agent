@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::proxy::ProxySettings;
+
 pub const DEFAULT_API_URL: &str = "https://api.bynh.io";
 pub const DEFAULT_CONCURRENCY: usize = 64;
 pub const MAX_CONCURRENCY: usize = 4096;
@@ -33,6 +35,11 @@ pub struct Config {
     pub log_format: LogFormat,
     /// Extra PEM roots for internal certificate authorities.
     pub ca_file: Option<PathBuf>,
+    /// Outbound proxy for the platform connection (and for checks with
+    /// `check_via_proxy`).
+    pub proxy: ProxySettings,
+    /// Send checks through the proxy too. Requires `allow_private`.
+    pub check_via_proxy: bool,
     /// Where the settings came from (for the startup log line).
     pub source: Option<PathBuf>,
 }
@@ -57,6 +64,8 @@ impl fmt::Debug for Config {
             .field("log", &self.log)
             .field("log_format", &self.log_format)
             .field("ca_file", &self.ca_file)
+            .field("proxy", &self.proxy.describe())
+            .field("check_via_proxy", &self.check_via_proxy)
             .field("source", &self.source)
             .finish()
     }
@@ -91,6 +100,8 @@ impl Default for Config {
             log: "info".to_owned(),
             log_format: LogFormat::Human,
             ca_file: None,
+            proxy: ProxySettings::default(),
+            check_via_proxy: false,
             source: None,
         }
     }
@@ -110,6 +121,9 @@ struct FileConfig {
     log: Option<String>,
     log_format: Option<LogFormat>,
     ca_file: Option<PathBuf>,
+    proxy_url: Option<String>,
+    no_proxy: Option<String>,
+    check_via_proxy: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -238,6 +252,28 @@ impl Config {
             None => file.log_format.unwrap_or_default(),
         };
         c.ca_file = env("BYNH_CA_FILE").map(PathBuf::from).or(file.ca_file);
+
+        let proxy_url = env("BYNH_PROXY_URL").or(file.proxy_url.filter(|v| !v.trim().is_empty()));
+        let no_proxy = env("BYNH_NO_PROXY").or(file.no_proxy);
+        c.proxy =
+            ProxySettings::resolve(proxy_url.as_deref(), no_proxy.as_deref(), &env).map_err(err)?;
+        c.check_via_proxy = match env("BYNH_CHECK_VIA_PROXY") {
+            Some(v) => parse_bool("BYNH_CHECK_VIA_PROXY", &v)?,
+            None => file.check_via_proxy.unwrap_or(false),
+        };
+        if c.check_via_proxy {
+            if c.proxy.is_empty() {
+                return Err(err(
+                    "check_via_proxy is on but no proxy is configured (set proxy_url or HTTPS_PROXY)",
+                ));
+            }
+            if !c.allow_private {
+                return Err(err(
+                    "check_via_proxy requires allow_private = true: through a proxy the agent can't see \
+                     which address a check finally reaches, so it can't refuse private targets",
+                ));
+            }
+        }
 
         c.api_url = normalize_api_url(&c.api_url)?;
         Ok(c)
@@ -418,6 +454,60 @@ mod tests {
         assert_eq!(c.source.as_deref(), Some(a.path()));
         // an explicit path must exist
         assert!(Config::load(Some(&missing), &[], &env_of(&[])).is_err());
+    }
+
+    #[test]
+    fn proxy_settings_and_validation() {
+        let f = file("proxy_url = \"http://u:p@proxy.corp:3128\"\nno_proxy = \"localhost\"\n");
+        let c = Config::load(
+            Some(f.path()),
+            &[],
+            &env_of(&[("HTTPS_PROXY", "http://env:1")]),
+        )
+        .unwrap();
+        assert_eq!(c.proxy.https.as_ref().unwrap().host, "proxy.corp");
+        assert!(c.proxy.no_proxy.matches("localhost"));
+        assert!(!c.check_via_proxy);
+        let dbg = format!("{c:?}");
+        assert!(!dbg.contains("u:p"), "{dbg}");
+
+        // BYNH_PROXY_URL beats the file; standard variables apply without either
+        let c = Config::load(
+            Some(f.path()),
+            &[],
+            &env_of(&[("BYNH_PROXY_URL", "http://bynh:2")]),
+        )
+        .unwrap();
+        assert_eq!(c.proxy.http.as_ref().unwrap().host, "bynh");
+        let c = Config::load(None, &[], &env_of(&[("https_proxy", "http://std:3")])).unwrap();
+        assert_eq!(c.proxy.https.as_ref().unwrap().host, "std");
+        assert!(c.proxy.http.is_none());
+
+        // check_via_proxy needs a proxy and allow_private
+        let e = Config::load(None, &[], &env_of(&[("BYNH_CHECK_VIA_PROXY", "true")])).unwrap_err();
+        assert!(e.0.contains("no proxy"), "{e}");
+        let e = Config::load(
+            None,
+            &[],
+            &env_of(&[
+                ("BYNH_CHECK_VIA_PROXY", "true"),
+                ("HTTPS_PROXY", "http://p:1"),
+            ]),
+        )
+        .unwrap_err();
+        assert!(e.0.contains("allow_private"), "{e}");
+        let c = Config::load(
+            None,
+            &[],
+            &env_of(&[
+                ("BYNH_CHECK_VIA_PROXY", "true"),
+                ("HTTPS_PROXY", "http://p:1"),
+                ("BYNH_ALLOW_PRIVATE", "true"),
+            ]),
+        )
+        .unwrap();
+        assert!(c.check_via_proxy);
+        assert!(Config::load(None, &[], &env_of(&[("BYNH_PROXY_URL", "socks5://x:1")])).is_err());
     }
 
     #[test]

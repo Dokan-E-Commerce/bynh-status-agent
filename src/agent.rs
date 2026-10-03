@@ -100,14 +100,22 @@ impl Agent {
             .map_err(|e| e.to_string())?
             .to_owned();
         let net = Arc::new(Net::new(config.ca_file.as_deref())?);
-        let prober = Arc::new(Prober::new(
+        let mut prober = Prober::new(
             net.clone(),
             Guard::new(config.allow_private),
             config.report_ip,
-        ));
+        );
+        if config.check_via_proxy {
+            if !config.allow_private {
+                return Err("check_via_proxy requires allow_private = true".into());
+            }
+            prober = prober.with_proxy(config.proxy.clone());
+        }
+        let prober = Arc::new(prober);
         let buffer = Arc::new(ResultBuffer::new(tun.buffer_capacity));
         let scheduler = Scheduler::new(prober, buffer.clone(), config.concurrency);
-        let client = PlatformClient::new(net, &config.api_url, &token, tun.request_timeout);
+        let client = PlatformClient::new(net, &config.api_url, &token, tun.request_timeout)
+            .with_proxy(config.proxy.clone());
         Ok(Self {
             config,
             tun,
@@ -136,6 +144,8 @@ impl Agent {
             allow_private = self.config.allow_private,
             report_ip = self.config.report_ip,
             concurrency = self.config.concurrency,
+            proxy = %self.config.proxy.describe(),
+            check_via_proxy = self.config.check_via_proxy,
             config_file = ?self.config.source,
             "bynh-status-agent starting"
         );

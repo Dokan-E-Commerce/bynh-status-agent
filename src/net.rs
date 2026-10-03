@@ -21,13 +21,14 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use time::OffsetDateTime;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 
 use crate::netguard::Guard;
 use crate::protocol::{CheckError, ErrorKind, IpVersion, Timings};
+use crate::proxy::ProxyEndpoint;
 
 /// Shared networking context: one DNS resolver and the two TLS configurations.
 pub struct Net {
@@ -54,6 +55,9 @@ pub struct HttpRequest<'a> {
     pub verify_tls: bool,
     pub ip_version: IpVersion,
     pub guard: &'a Guard,
+    /// Send the request through this proxy (CONNECT for https, absolute-form
+    /// for http). The private-address guard then applies to the proxy.
+    pub proxy: Option<&'a ProxyEndpoint>,
     /// Read at most this many body bytes; the rest is discarded unread.
     pub max_body: usize,
 }
@@ -143,6 +147,46 @@ impl Net {
         Ok(tcp)
     }
 
+    /// Connects to a proxy. Timings describe the proxy connection and
+    /// `remote_ip` stays unset: through a proxy the target's address is unknown.
+    pub async fn connect_proxy(
+        &self,
+        proxy: &ProxyEndpoint,
+        guard: &Guard,
+        trace: &mut Trace,
+    ) -> Result<TcpStream, CheckError> {
+        let r = self
+            .connect(&proxy.host, proxy.port, IpVersion::Any, guard, trace)
+            .await;
+        trace.remote_ip = None;
+        r.map_err(|e| CheckError::new(e.kind, format!("proxy {proxy}: {}", e.message)))
+    }
+
+    /// A TCP connection to `host:port`, directly or through a CONNECT tunnel.
+    pub async fn connect_target(
+        &self,
+        host: &str,
+        port: u16,
+        ipv: IpVersion,
+        guard: &Guard,
+        proxy: Option<&ProxyEndpoint>,
+        trace: &mut Trace,
+    ) -> Result<TcpStream, CheckError> {
+        match proxy {
+            None => self.connect(host, port, ipv, guard, trace).await,
+            Some(p) => {
+                let mut tcp = self.connect_proxy(p, guard, trace).await?;
+                let auth = if host.contains(':') {
+                    format!("[{host}]:{port}")
+                } else {
+                    format!("{host}:{port}")
+                };
+                tunnel(&mut tcp, &auth, p, trace).await?;
+                Ok(tcp)
+            }
+        }
+    }
+
     /// Runs a TLS handshake over `tcp`. Fills `trace.timings.tls_ms` and
     /// `trace.tls_expires_at` (the leaf certificate's notAfter).
     pub async fn tls_handshake(
@@ -196,17 +240,41 @@ impl Net {
             .port_or_known_default()
             .ok_or_else(|| CheckError::new(ErrorKind::Other, "URL has no port"))?;
 
-        let tcp = self
-            .connect(&host, port, req.ip_version, req.guard, trace)
-            .await?;
+        let mut absolute_form = false;
+        let tcp = match req.proxy {
+            Some(p) => {
+                let mut tcp = self.connect_proxy(p, req.guard, trace).await?;
+                if https {
+                    tunnel(&mut tcp, &authority(url, port), p, trace).await?;
+                } else {
+                    absolute_form = true;
+                }
+                tcp
+            }
+            None => {
+                self.connect(&host, port, req.ip_version, req.guard, trace)
+                    .await?
+            }
+        };
 
-        let mut builder = Request::builder()
-            .method(req.method.clone())
-            .uri(&url[url::Position::BeforePath..url::Position::AfterQuery]);
+        let target = if absolute_form {
+            &url[..url::Position::AfterQuery]
+        } else {
+            &url[url::Position::BeforePath..url::Position::AfterQuery]
+        };
+        let mut builder = Request::builder().method(req.method.clone()).uri(target);
         let headers = builder
             .headers_mut()
             .ok_or_else(|| CheckError::new(ErrorKind::Other, "invalid request"))?;
         headers.extend(req.headers.clone());
+        if absolute_form {
+            if let Some(auth) = req.proxy.and_then(|p| p.authorization.as_deref()) {
+                let mut v = HeaderValue::from_str(auth)
+                    .map_err(|_| CheckError::new(ErrorKind::Other, "invalid proxy credentials"))?;
+                v.set_sensitive(true);
+                headers.insert(header::PROXY_AUTHORIZATION, v);
+            }
+        }
         let host_header = match url.port() {
             Some(p) => format!("{}:{p}", url.host_str().unwrap_or_default()),
             None => url.host_str().unwrap_or_default().to_owned(),
@@ -260,6 +328,79 @@ pub fn host_of(url: &url::Url) -> Result<String, CheckError> {
         Some(url::Host::Ipv6(ip)) => Ok(ip.to_string()),
         None => Err(CheckError::new(ErrorKind::Other, "URL has no host")),
     }
+}
+
+/// `host:port` for CONNECT, with IPv6 brackets.
+fn authority(url: &url::Url, port: u16) -> String {
+    format!("{}:{port}", url.host_str().unwrap_or_default())
+}
+
+/// Largest CONNECT response header we accept from a proxy.
+const MAX_PROXY_RESPONSE: usize = 16 * 1024;
+
+/// Opens an HTTP CONNECT tunnel to `authority` over a proxy connection. The
+/// time it takes is added to `connect_ms`.
+async fn tunnel(
+    tcp: &mut TcpStream,
+    authority: &str,
+    proxy: &ProxyEndpoint,
+    trace: &mut Trace,
+) -> Result<(), CheckError> {
+    let conn_err = |m: String| CheckError::new(ErrorKind::Connect, format!("proxy {proxy}: {m}"));
+    let start = Instant::now();
+    let mut req = format!(
+        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: {}\r\n",
+        crate::protocol::user_agent()
+    );
+    if let Some(auth) = &proxy.authorization {
+        req.push_str("Proxy-Authorization: ");
+        req.push_str(auth);
+        req.push_str("\r\n");
+    }
+    req.push_str("\r\n");
+    tcp.write_all(req.as_bytes())
+        .await
+        .map_err(|e| conn_err(format!("sending CONNECT: {e}")))?;
+    drop(req);
+
+    let mut buf = Vec::with_capacity(512);
+    let mut chunk = [0u8; 1024];
+    let end = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        if buf.len() > MAX_PROXY_RESPONSE {
+            return Err(conn_err("response header too large".into()));
+        }
+        let n = tcp
+            .read(&mut chunk)
+            .await
+            .map_err(|e| conn_err(format!("reading CONNECT response: {e}")))?;
+        if n == 0 {
+            return Err(conn_err("closed the connection during CONNECT".into()));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    if end != buf.len() {
+        return Err(conn_err(
+            "sent unexpected data after the CONNECT response".into(),
+        ));
+    }
+    let line = String::from_utf8_lossy(&buf[..buf.iter().position(|&b| b == b'\r').unwrap_or(0)])
+        .into_owned();
+    let status = line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or_else(|| conn_err("invalid CONNECT response".into()))?;
+    match status {
+        200..=299 => {}
+        407 => return Err(conn_err("proxy authentication required (407)".into())),
+        s => return Err(conn_err(format!("refused the tunnel (status {s})"))),
+    }
+    let tunnel_ms = ms(start.elapsed());
+    trace.timings.connect_ms = Some(trace.timings.connect_ms.unwrap_or(0) + tunnel_ms);
+    Ok(())
 }
 
 /// Picks the address to connect to. `any` prefers IPv4 (more widely

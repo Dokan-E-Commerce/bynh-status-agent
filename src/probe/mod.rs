@@ -14,6 +14,7 @@ use time::OffsetDateTime;
 use crate::net::{self, HttpRequest, Net, Trace};
 use crate::netguard::Guard;
 use crate::protocol::{rfc3339, Auth, Check, CheckError, CheckResult, CheckType, ErrorKind};
+use crate::proxy::{ProxyEndpoint, ProxySettings};
 
 /// Maximum number of response body bytes read per request.
 pub const MAX_BODY: usize = 1 << 20;
@@ -24,6 +25,8 @@ pub struct Prober {
     net: Arc<Net>,
     guard: Guard,
     report_ip: bool,
+    /// Set only with `check_via_proxy = true`.
+    proxy: Option<Arc<ProxySettings>>,
 }
 
 #[derive(Default)]
@@ -43,7 +46,20 @@ impl Prober {
             net,
             guard,
             report_ip,
+            proxy: None,
         }
+    }
+
+    /// Send checks through an outbound proxy (`check_via_proxy`). Through a
+    /// proxy the agent can't vet the final address, so callers must only do
+    /// this with `allow_private = true`.
+    pub fn with_proxy(mut self, proxy: ProxySettings) -> Self {
+        self.proxy = (!proxy.is_empty()).then(|| Arc::new(proxy));
+        self
+    }
+
+    fn proxy_for_host(&self, host: &str) -> Option<&ProxyEndpoint> {
+        self.proxy.as_deref().and_then(|p| p.for_host(host, true))
     }
 
     /// Runs `check` once, bounded by its timeout. Never panics, never fails:
@@ -150,6 +166,7 @@ impl Prober {
                         verify_tls: check.verify_tls,
                         ip_version: check.ip_version,
                         guard: &self.guard,
+                        proxy: self.proxy.as_deref().and_then(|p| p.for_url(&url)),
                         max_body: MAX_BODY,
                     },
                     &mut out.trace,
@@ -225,17 +242,33 @@ impl Prober {
 
     async fn tcp(&self, check: &Check, out: &mut Outcome) -> Result<(), CheckError> {
         let (host, port) = host_port(check, None)?;
+        let proxy = self.proxy_for_host(&host);
         self.net
-            .connect(&host, port, check.ip_version, &self.guard, &mut out.trace)
+            .connect_target(
+                &host,
+                port,
+                check.ip_version,
+                &self.guard,
+                proxy,
+                &mut out.trace,
+            )
             .await?;
         Ok(())
     }
 
     async fn tls(&self, check: &Check, out: &mut Outcome) -> Result<(), CheckError> {
         let (host, port) = host_port(check, Some(443))?;
+        let proxy = self.proxy_for_host(&host);
         let tcp = self
             .net
-            .connect(&host, port, check.ip_version, &self.guard, &mut out.trace)
+            .connect_target(
+                &host,
+                port,
+                check.ip_version,
+                &self.guard,
+                proxy,
+                &mut out.trace,
+            )
             .await?;
         if let Err(e) = self
             .net
@@ -248,7 +281,14 @@ impl Prober {
                 let mut probe = Trace::default();
                 if let Ok(tcp) = self
                     .net
-                    .connect(&host, port, check.ip_version, &self.guard, &mut probe)
+                    .connect_target(
+                        &host,
+                        port,
+                        check.ip_version,
+                        &self.guard,
+                        proxy,
+                        &mut probe,
+                    )
                     .await
                 {
                     if self

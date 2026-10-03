@@ -220,6 +220,9 @@ The file is read from `--config <path>` (or `BYNH_CONFIG`), otherwise from
 | `log` | `BYNH_LOG` | `info` | Log level or filter, such as `debug` or `warn`. |
 | `log_format` | `BYNH_LOG_FORMAT` | `human` | `human` or `json`. Also `--log-format`. |
 | `ca_file` | `BYNH_CA_FILE` | – | Extra PEM root certificates, for internal certificate authorities. |
+| `proxy_url` | `BYNH_PROXY_URL` | – | Outbound proxy, `http://[user:pass@]host:port`. Without it, `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` are used. |
+| `no_proxy` | `BYNH_NO_PROXY` | – | Hosts that bypass the proxy. Without it, `NO_PROXY` is used. |
+| `check_via_proxy` | `BYNH_CHECK_VIA_PROXY` | `false` | Send checks through the proxy too. Requires `allow_private = true`. |
 
 Token lookup order: `BYNH_TOKEN`, `BYNH_TOKEN_FILE`, `token`, `token_file`, then the systemd credential
 `$CREDENTIALS_DIRECTORY/bynh-token`. Values such as `true`, `false`, `1`, `0`, `yes` and `no` are
@@ -235,6 +238,33 @@ concurrency = 64
 
 How often to poll, how often to report and how big a batch may be come from the platform in the
 `hello` response.
+
+### Outbound proxies
+
+On networks where the internet is only reachable through a proxy, set `proxy_url` (or the usual
+`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY` variables; lowercase forms take precedence,
+as with curl). Only `http://` proxies are supported, with optional basic credentials in the URL
+(`http://user:pass@proxy.corp:3128`, percent-encode special characters). Credentials are never
+logged; logs show the proxy as `http://proxy.corp:3128 (with credentials)`.
+
+- **The platform connection** goes through the proxy unless `no_proxy` matches `api_url`. HTTPS uses a
+  `CONNECT` tunnel, so TLS runs end to end between the agent and bynh.
+- **Checks connect directly by default** (`check_via_proxy = false`), so results show whether your
+  services are reachable from the agent’s network, not from the proxy’s.
+- **`check_via_proxy = true`** sends checks through the proxy as well: `CONNECT` tunnels for https,
+  tcp and tls checks, and absolute-form requests for plain http. `no_proxy` still applies per host.
+  The trade-off: through a proxy the agent can’t see which address a check finally reaches, so it
+  can’t enforce the private-address rules. That is why this setting requires `allow_private = true`;
+  the agent refuses to start otherwise. Through a proxy, `remote_ip` is `null`, and `dns_ms` and
+  `connect_ms` describe the connection to the proxy (the tunnel setup is included in `connect_ms`).
+
+`no_proxy` takes a comma-separated list of `*`, domains (`example.com` also matches its subdomains,
+as does `.example.com`), IP addresses and CIDR ranges (`10.0.0.0/8`).
+
+```toml
+proxy_url = "http://proxy.corp:3128"
+no_proxy = "localhost, .corp.internal, 10.0.0.0/8"
+```
 
 ## Commands
 
@@ -296,6 +326,9 @@ other than the monitored target. There is no telemetry, no crash reporting and n
 - **Least privilege when packaged.** The image is scratch-based, runs as UID 65532 and works with a
   read-only root file system. The systemd unit uses a dynamic user with no capabilities, a read-only
   system, restricted address families and system calls, and a 128 MB memory cap.
+- **Proxies.** Proxy credentials are never logged. Checks bypass the proxy unless
+  `check_via_proxy = true`, which requires `allow_private = true` because the final address can’t be
+  vetted through a proxy (see [Outbound proxies](#outbound-proxies)).
 - **TLS** uses rustls with the Mozilla root store built in, so it doesn’t depend on the host’s
   certificate bundle. Add internal roots with `ca_file`. `verify_tls = false` on a monitor skips
   certificate validation for that monitor only.

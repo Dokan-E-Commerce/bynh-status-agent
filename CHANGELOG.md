@@ -25,5 +25,8 @@ First release, implementing the bynh agent protocol v1.
   file or a systemd credential.
 - `bynh-status-agent check` for one-off local checks, JSON or human logs, graceful shutdown with a
   final flush.
+- Outbound proxy support (`proxy_url`, `no_proxy`, or `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`/`NO_PROXY`)
+  for the platform connection, with `CONNECT` tunnels and basic proxy credentials; optional
+  `check_via_proxy` for checks (requires `allow_private`).
 - Multi-arch scratch container image, hardened systemd unit, installer, Docker Compose and
   Kubernetes examples.
