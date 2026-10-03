@@ -65,9 +65,10 @@ if [ "$VERSION" != "latest" ]; then
 fi
 if [ -n "$API_URL" ]; then
     # Only characters that are safe inside a TOML string and a URL.
-    printf '%s\n' "$API_URL" | grep -Eq '^[]A-Za-z0-9._~:/?#@!$&()*+,;=%[-]+$' \
-        && [ "$(printf '%s' "$API_URL" | wc -l)" -eq 0 ] \
-        || die "--api-url contains characters that aren't allowed"
+    if ! printf '%s\n' "$API_URL" | grep -Eq '^[]A-Za-z0-9._~:/?#@!$&()*+,;=%[-]+$' \
+        || [ "$(printf '%s' "$API_URL" | wc -l)" -ne 0 ]; then
+        die "--api-url contains characters that aren't allowed"
+    fi
     case "$API_URL" in
         https://*) ;;
         http://127.0.0.1|http://127.0.0.1[:/]*|http://localhost|http://localhost[:/]*|http://\[::1\]|http://\[::1\][:/]*) ;;

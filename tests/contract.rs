@@ -7,10 +7,14 @@ use bynh_status_agent::protocol::{
     PROTOCOL_HEADER, PROTOCOL_VERSION,
 };
 
-const PROTOCOL: &str = include_str!("../PROTOCOL.md");
+const PROTOCOL_RAW: &str = include_str!("../PROTOCOL.md");
+
+/// PROTOCOL.md with LF line endings, whatever the checkout did (Windows can check it out as CRLF).
+static PROTOCOL_LF: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| PROTOCOL_RAW.replace("\r\n", "\n"));
 
 fn line_with(needle: &str) -> &'static str {
-    PROTOCOL
+    PROTOCOL_LF
         .lines()
         .find(|l| l.contains(needle))
         .unwrap_or_else(|| panic!("PROTOCOL.md has no line containing {needle:?}"))
@@ -19,21 +23,21 @@ fn line_with(needle: &str) -> &'static str {
 #[test]
 fn protocol_header() {
     assert_eq!(PROTOCOL_HEADER, "X-Bynh-Agent-Protocol");
-    assert!(PROTOCOL.contains(&format!("`{PROTOCOL_HEADER}: {PROTOCOL_VERSION}`")));
-    assert!(PROTOCOL.contains("`Authorization: Bearer <token>`"));
+    assert!(PROTOCOL_LF.contains(&format!("`{PROTOCOL_HEADER}: {PROTOCOL_VERSION}`")));
+    assert!(PROTOCOL_LF.contains("`Authorization: Bearer <token>`"));
 }
 
 #[test]
 fn endpoint_paths() {
-    assert!(PROTOCOL.contains(&format!("### POST {PATH_HELLO}\n")));
-    assert!(PROTOCOL.contains(&format!("### GET {PATH_ASSIGNMENTS}\n")));
-    assert!(PROTOCOL.contains(&format!("### POST {PATH_RESULTS}\n")));
-    assert!(PROTOCOL.contains(&format!("Base URL default `{DEFAULT_API_URL}`")));
+    assert!(PROTOCOL_LF.contains(&format!("### POST {PATH_HELLO}\n")));
+    assert!(PROTOCOL_LF.contains(&format!("### GET {PATH_ASSIGNMENTS}\n")));
+    assert!(PROTOCOL_LF.contains(&format!("### POST {PATH_RESULTS}\n")));
+    assert!(PROTOCOL_LF.contains(&format!("Base URL default `{DEFAULT_API_URL}`")));
 }
 
 #[test]
 fn user_agent_format() {
-    assert!(PROTOCOL.contains("`User-Agent: bynh-status-agent/<version> (<os>; <arch>)`"));
+    assert!(PROTOCOL_LF.contains("`User-Agent: bynh-status-agent/<version> (<os>; <arch>)`"));
     let ua = user_agent();
     let expected = format!(
         "bynh-status-agent/{AGENT_VERSION} ({}; {})",
