@@ -1,0 +1,61 @@
+# kubectl create namespace bynh
+# kubectl -n bynh create secret generic bynh-status-agent --from-literal=token='bynh_agt_…'
+# kubectl -n bynh apply -f deploy/kubernetes/deployment.yaml
+#
+# One replica per agent token: two agents with the same token would run every
+# check twice.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bynh-status-agent
+  labels:
+    app.kubernetes.io/name: bynh-status-agent
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bynh-status-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bynh-status-agent
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bynh-status-agent
+          image: ghcr.io/dokan-e-commerce/bynh-status-agent:1
+          args: ["run"]
+          env:
+            - name: BYNH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: bynh-status-agent
+                  key: token
+            - name: BYNH_LOG_FORMAT
+              value: json
+            # On-premise agents that check in-cluster or internal hosts:
+            # - name: BYNH_ALLOW_PRIVATE
+            #   value: "true"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]

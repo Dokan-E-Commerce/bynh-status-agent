@@ -1,0 +1,29 @@
+# docker compose -f deploy/docker-compose.yml up -d
+#
+# Put the token in a .env file next to this one (BYNH_TOKEN=bynh_agt_…) or
+# export it in your shell. Never commit it.
+services:
+  bynh-status-agent:
+    image: ghcr.io/dokan-e-commerce/bynh-status-agent:1
+    container_name: bynh-status-agent
+    restart: unless-stopped
+    environment:
+      BYNH_TOKEN: ${BYNH_TOKEN:?set BYNH_TOKEN to your agent token}
+      # On-premise agents that check internal hosts:
+      # BYNH_ALLOW_PRIVATE: "true"
+      # BYNH_REPORT_IP: "false"
+      # BYNH_LOG: "info"
+      # BYNH_LOG_FORMAT: "json"
+    read_only: true
+    user: "65532:65532"
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 128m
+    cpus: 0.5
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

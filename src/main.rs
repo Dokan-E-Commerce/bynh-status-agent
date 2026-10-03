@@ -176,7 +176,10 @@ fn init_logging(config: &Config, to_stderr: bool) {
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
-        .with_ansi(ansi);
+        .with_ansi(ansi)
+        // If stdout and stderr are both gone (closed pipe), stay quiet
+        // rather than abort while reporting the failed write.
+        .log_internal_errors(false);
     match (config.log_format, to_stderr) {
         (LogFormat::Json, false) => builder
             .json()

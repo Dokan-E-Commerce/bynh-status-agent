@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1.7
+#
+# Release image: packages the exact binaries attached to the GitHub release
+# (built by .github/workflows/release.yml) instead of compiling again.
+# Expects dist/bynh-status-agent-amd64 and dist/bynh-status-agent-arm64.
+#
+#   docker buildx build -f Dockerfile.release --platform linux/amd64,linux/arm64 .
+
+FROM --platform=$BUILDPLATFORM alpine:3.22 AS certs
+RUN apk add --no-cache ca-certificates
+
+FROM scratch
+ARG TARGETARCH
+ARG VERSION=dev
+LABEL org.opencontainers.image.title="bynh-status-agent" \
+      org.opencontainers.image.description="Uptime monitoring agent for bynh" \
+      org.opencontainers.image.source="https://github.com/Dokan-E-Commerce/bynh-status-agent" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}"
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --chmod=0755 dist/bynh-status-agent-${TARGETARCH} /bynh-status-agent
+USER 65532:65532
+ENTRYPOINT ["/bynh-status-agent"]
+CMD ["run"]

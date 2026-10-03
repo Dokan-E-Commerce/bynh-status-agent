@@ -1,0 +1,53 @@
+[Unit]
+Description=bynh uptime monitoring agent
+Documentation=https://github.com/Dokan-E-Commerce/bynh-status-agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/bynh-status-agent run --config /etc/bynh-status-agent/bynh-status-agent.toml
+# The token lives in a root-only file and reaches the agent as a systemd
+# credential ($CREDENTIALS_DIRECTORY/bynh-token), never on the command line.
+LoadCredential=bynh-token:/etc/bynh-status-agent/token
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+# Identity: a throwaway user allocated at start, no home, no state.
+DynamicUser=yes
+UMask=0077
+
+# Hardening
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+# Resources
+MemoryMax=128M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,47 @@
+bynh-status-agent under systemd
+========================
+
+Requires systemd 247 or newer (LoadCredential with DynamicUser): Debian 11+,
+Ubuntu 22.04+, RHEL/Rocky/Alma 9+, Fedora, Arch.
+
+The quickest path is install.sh at the repository root, which does all of
+the steps below. To do it by hand:
+
+1. Install the binary
+
+     install -m 0755 bynh-status-agent-x86_64-unknown-linux-musl /usr/local/bin/bynh-status-agent
+
+2. Store the token in a root-only file (it is handed to the service as a
+   systemd credential, so the agent's dynamic user never needs to read /etc):
+
+     install -d -m 0755 /etc/bynh-status-agent
+     ( umask 077; read -rs -p 'bynh agent token: ' t; printf '%s\n' "$t" > /etc/bynh-status-agent/token )
+
+3. Optional settings in /etc/bynh-status-agent/bynh-status-agent.toml (no secrets in it):
+
+     api_url = "https://api.bynh.io"
+     allow_private = false   # true for on-premise agents checking internal hosts
+     report_ip = true
+     concurrency = 64
+
+   The file is optional; every key can also be set with BYNH_* variables
+   in a drop-in (systemctl edit bynh-status-agent):
+
+     [Service]
+     Environment=BYNH_ALLOW_PRIVATE=true
+
+4. Install and start the unit
+
+     install -m 0644 bynh-status-agent.service /etc/systemd/system/bynh-status-agent.service
+     systemctl daemon-reload
+     systemctl enable --now bynh-status-agent
+
+5. Check it
+
+     systemctl status bynh-status-agent
+     journalctl -u bynh-status-agent -f
+
+The unit runs the agent as a dynamic, unprivileged user with no capabilities,
+a read-only file system, only IPv4/IPv6/Unix sockets and a 128 MB memory cap.
+Rotating the token: write the new one to /etc/bynh-status-agent/token and run
+systemctl restart bynh-status-agent.

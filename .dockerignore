@@ -1,0 +1,7 @@
+target
+.git
+.github
+deploy
+*.md
+install.sh
+bynh-status-agent.toml
