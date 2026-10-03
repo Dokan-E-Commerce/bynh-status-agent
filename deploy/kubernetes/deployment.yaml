@@ -4,6 +4,15 @@
 #
 # One replica per agent token: two agents with the same token would run every
 # check twice.
+#
+# For production, pin the image by digest so a re-pushed tag can't change what
+# runs (find it with `docker buildx imagetools inspect` or on the release page),
+# and verify its signature first (see README, "Verifying releases"):
+#   image: ghcr.io/dokan-e-commerce/bynh-status-agent:1.0.0@sha256:<digest>
+#
+# The token is mounted as a file rather than an environment variable.
+# networkpolicy.yaml next to this file restricts egress for agents that must
+# not reach internal networks.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -29,6 +38,7 @@ spec:
         runAsNonRoot: true
         runAsUser: 65532
         runAsGroup: 65532
+        fsGroup: 65532   # lets the agent read the mounted token (mode 0440)
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -36,11 +46,8 @@ spec:
           image: ghcr.io/dokan-e-commerce/bynh-status-agent:1
           args: ["run"]
           env:
-            - name: BYNH_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: bynh-status-agent
-                  key: token
+            - name: BYNH_TOKEN_FILE
+              value: /run/secrets/bynh/token
             - name: BYNH_LOG_FORMAT
               value: json
             # On-premise agents that check in-cluster or internal hosts:
@@ -53,9 +60,18 @@ spec:
             limits:
               cpu: 500m
               memory: 128Mi
+          volumeMounts:
+            - name: token
+              mountPath: /run/secrets/bynh
+              readOnly: true
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
             runAsNonRoot: true
             capabilities:
               drop: ["ALL"]
+      volumes:
+        - name: token
+          secret:
+            secretName: bynh-status-agent
+            defaultMode: 0440

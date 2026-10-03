@@ -7,7 +7,12 @@ services:
     image: ghcr.io/dokan-e-commerce/bynh-status-agent:1
     container_name: bynh-status-agent
     restart: unless-stopped
+    # Preferred: the token as a file (secret), not an environment variable.
+    # Create ./bynh_token with the token, then: chgrp 65532 bynh_token && chmod 0440 bynh_token
+    # and swap the BYNH_TOKEN line below for the two commented lines.
+    # secrets: [bynh_token]
     environment:
+      # BYNH_TOKEN_FILE: /run/secrets/bynh_token
       BYNH_TOKEN: ${BYNH_TOKEN:?set BYNH_TOKEN to your agent token}
       # On-premise agents that check internal hosts:
       # BYNH_ALLOW_PRIVATE: "true"
@@ -30,3 +35,7 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+# secrets:
+#   bynh_token:
+#     file: ./bynh_token

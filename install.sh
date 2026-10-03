@@ -38,6 +38,8 @@ ACTION="install"
 PURGE="no"
 
 say() { printf '%s\n' "$*"; }
+# Escapes a value for a TOML basic string (backslash and double quote).
+toml_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
@@ -55,6 +57,23 @@ while [ $# -gt 0 ]; do
         *) die "unknown option: $1 (see --help)" ;;
     esac
 done
+
+# --- validate options before touching anything --------------------------------
+if [ "$VERSION" != "latest" ]; then
+    printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' \
+        || die "--version must look like 1.2.3"
+fi
+if [ -n "$API_URL" ]; then
+    # Only characters that are safe inside a TOML string and a URL.
+    printf '%s\n' "$API_URL" | grep -Eq '^[]A-Za-z0-9._~:/?#@!$&()*+,;=%[-]+$' \
+        && [ "$(printf '%s' "$API_URL" | wc -l)" -eq 0 ] \
+        || die "--api-url contains characters that aren't allowed"
+    case "$API_URL" in
+        https://*) ;;
+        http://127.0.0.1|http://127.0.0.1[:/]*|http://localhost|http://localhost[:/]*|http://\[::1\]|http://\[::1\][:/]*) ;;
+        *) die "--api-url must use https:// (plain http is only accepted for loopback addresses)" ;;
+    esac
+fi
 
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo sh install.sh)"
 [ "$(uname -s)" = "Linux" ] || die "this installer supports Linux with systemd; on other systems use the release binary or the Docker image"
@@ -96,7 +115,7 @@ download() { # url dest
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL --proto '=https' --tlsv1.2 -o "$2" "$1"
     elif command -v wget >/dev/null 2>&1; then
-        wget -q -O "$2" "$1"
+        wget -q --https-only -O "$2" "$1"
     else
         die "need curl or wget"
     fi
@@ -117,6 +136,7 @@ TOKEN="${BYNH_TOKEN:-}"
 if [ -z "$TOKEN" ] && [ ! -s "$TOKEN_FILE" ]; then
     if [ -r /dev/tty ]; then
         printf 'bynh agent token (from Settings → Agents): ' > /dev/tty
+        trap 'stty echo < /dev/tty 2>/dev/null' EXIT INT TERM
         stty -echo < /dev/tty 2>/dev/null || true
         IFS= read -r TOKEN < /dev/tty || true
         stty echo < /dev/tty 2>/dev/null || true
@@ -136,7 +156,7 @@ fi
 
 # --- download and verify -----------------------------------------------------
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT INT TERM
+trap 'rm -rf "$TMP"; stty echo < /dev/tty 2>/dev/null || true' EXIT INT TERM
 say "Downloading ${ASSET} (${VERSION})…"
 download "${BASE}/${ASSET}" "${TMP}/${ASSET}"
 download "${BASE}/SHA256SUMS" "${TMP}/SHA256SUMS"
@@ -153,6 +173,9 @@ mv -f "${BIN_DIR}/${NAME}.new" "${BIN_DIR}/${NAME}"
 
 # --- configuration -----------------------------------------------------------
 install -d -m 0755 "$CONF_DIR"
+# An existing directory keeps whatever owner/mode it had; make it root's.
+chown root:root "$CONF_DIR"
+chmod 0755 "$CONF_DIR"
 if [ -n "$TOKEN" ]; then
     (
         umask 077
@@ -162,6 +185,8 @@ if [ -n "$TOKEN" ]; then
     mv -f "${TOKEN_FILE}.new" "$TOKEN_FILE"
     say "Token saved to ${TOKEN_FILE} (root only)."
 else
+    chown root:root "$TOKEN_FILE"
+    chmod 0600 "$TOKEN_FILE"
     say "Keeping the existing token in ${TOKEN_FILE}."
 fi
 unset TOKEN
@@ -171,7 +196,7 @@ if [ ! -f "$CONF_FILE" ]; then
         say "# bynh-status-agent settings. The token is in ${TOKEN_FILE}, not here."
         say "# Every key is optional; BYNH_* environment variables override them."
         if [ -n "$API_URL" ]; then
-            say "api_url = \"${API_URL}\""
+            say "api_url = \"$(toml_escape "$API_URL")\""
         else
             say "# api_url = \"https://api.bynh.io\""
         fi
@@ -191,6 +216,7 @@ fi
 # --- systemd unit ------------------------------------------------------------
 install -d -m 0755 "$(dirname "$UNIT_FILE")"
 cat > "$UNIT_FILE" <<'UNIT'
+# Keep identical to the copy in install.sh (CI checks).
 [Unit]
 Description=bynh uptime monitoring agent
 Documentation=https://github.com/Dokan-E-Commerce/bynh-status-agent
@@ -200,13 +226,20 @@ After=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/bynh-status-agent run --config /etc/bynh-status-agent/bynh-status-agent.toml
+# The token lives in a root-only file and reaches the agent as a systemd
+# credential ($CREDENTIALS_DIRECTORY/bynh-token), never on the command line.
 LoadCredential=bynh-token:/etc/bynh-status-agent/token
 Restart=always
 RestartSec=5
 KillSignal=SIGTERM
 TimeoutStopSec=15
+
+# Identity: a throwaway user allocated at start, no home, no state.
 DynamicUser=yes
+PrivateUsers=yes
 UMask=0077
+
+# Hardening
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
@@ -214,6 +247,7 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
+DevicePolicy=closed
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
@@ -221,6 +255,7 @@ ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
+ProcSubset=pid
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=yes
 RestrictRealtime=yes
@@ -230,7 +265,11 @@ MemoryDenyWriteExecute=yes
 RemoveIPC=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+
+# Resources: each running check holds one or two sockets.
+LimitNOFILE=65536
 MemoryMax=128M
 TasksMax=64
 

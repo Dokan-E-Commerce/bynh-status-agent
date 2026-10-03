@@ -9,13 +9,12 @@
 # needed. The result is a single static binary, CA certificates and nothing
 # else: no shell, no package manager, runs as UID/GID 65532.
 
-ARG RUST_VERSION=1
-ARG ALPINE_VERSION=3.22
-
-FROM rust:${RUST_VERSION}-alpine${ALPINE_VERSION} AS build
+# Pinned by digest; Dependabot keeps it current. Same toolchain as
+# rust-toolchain.toml.
+FROM rust:1.97.1-alpine3.22@sha256:df4efa4e0cdfb5245fa06e3f431387b2bcc96782ce5681b7fb6b0297d745bc29 AS build
 RUN apk add --no-cache musl-dev ca-certificates
 WORKDIR /src
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \

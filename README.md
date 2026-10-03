@@ -51,6 +51,22 @@ docker run -d --name bynh-status-agent --restart unless-stopped \
 `-e BYNH_TOKEN` without a value passes the variable from your shell, so the token never appears in
 the command line. Follow the logs with `docker logs -f bynh-status-agent`.
 
+Environment variables are visible to anyone who can run `docker inspect`. Where that matters, mount
+the token as a file and point `BYNH_TOKEN_FILE` at it (the file must be readable by UID or GID 65532):
+
+```sh
+(umask 077; printf '%s\n' "$BYNH_TOKEN" > bynh_token) && sudo chgrp 65532 bynh_token && chmod 0440 bynh_token
+docker run -d --name bynh-status-agent --restart unless-stopped --read-only \
+  -v "$PWD/bynh_token:/run/secrets/bynh_token:ro" -e BYNH_TOKEN_FILE=/run/secrets/bynh_token \
+  ghcr.io/dokan-e-commerce/bynh-status-agent:1
+```
+
+The agent removes `BYNH_TOKEN` from its own environment after reading it, but the container
+runtime still shows the value it was started with.
+
+For production, pin the image by digest (`…/bynh-status-agent:1.0.0@sha256:…`) and verify its
+signature first; see [Verifying releases](#verifying-releases).
+
 ### Docker Compose
 
 [`deploy/docker-compose.yml`](deploy/docker-compose.yml) is ready to use. Put `BYNH_TOKEN=bynh_agt_…`
@@ -69,8 +85,15 @@ kubectl -n bynh apply -f deploy/kubernetes/deployment.yaml
 ```
 
 [`deploy/kubernetes/deployment.yaml`](deploy/kubernetes/deployment.yaml) runs one replica with a
-read-only root file system, no privileges or capabilities, a 128 Mi memory limit and JSON logs. To
-check in-cluster services, set `BYNH_ALLOW_PRIVATE=true` in the manifest.
+read-only root file system, no privileges or capabilities, a 128 Mi memory limit and JSON logs. The
+token is mounted from the Secret as a file (`BYNH_TOKEN_FILE`), not passed as an environment
+variable. To check in-cluster services, set `BYNH_ALLOW_PRIVATE=true` in the manifest. Pin the image
+by digest in production.
+
+For agents that must never reach internal networks, apply
+[`deploy/kubernetes/networkpolicy.yaml`](deploy/kubernetes/networkpolicy.yaml) too: it limits
+egress to the cluster DNS and public addresses, blocking cloud metadata and private ranges at the
+network level as a second line of defence.
 
 ### Podman
 
@@ -206,7 +229,8 @@ BYNH_TOKEN=… ./bynh-status-agent-x86_64-unknown-linux-musl
 
 Settings come from environment variables and, optionally, a TOML file. Environment variables win.
 The file is read from `--config <path>` (or `BYNH_CONFIG`), otherwise from
-`/etc/bynh-status-agent/bynh-status-agent.toml`, then `./bynh-status-agent.toml`. None is required.
+`/etc/bynh-status-agent/bynh-status-agent.toml`. None is required. The working directory is never
+searched, so a stray file can’t change the agent’s behaviour.
 
 | File key | Environment | Default | What it does |
 | --- | --- | --- | --- |
@@ -223,6 +247,8 @@ The file is read from `--config <path>` (or `BYNH_CONFIG`), otherwise from
 | `proxy_url` | `BYNH_PROXY_URL` | – | Outbound proxy, `http://[user:pass@]host:port`. Without it, `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` are used. |
 | `no_proxy` | `BYNH_NO_PROXY` | – | Hosts that bypass the proxy. Without it, `NO_PROXY` is used. |
 | `check_via_proxy` | `BYNH_CHECK_VIA_PROXY` | `false` | Send checks through the proxy too. Requires `allow_private = true`. |
+| `deny_cidrs` | `BYNH_DENY_CIDRS` | – | Networks checks may never reach, even with `allow_private` (TOML list, or comma-separated in the variable), e.g. `["10.20.0.0/16", "169.254.169.254"]`. |
+| `insecure_api_url` | `BYNH_INSECURE_API_URL` | `false` | Allow a plain-http `api_url` that isn’t loopback. The token would travel unencrypted; the agent logs a warning at start. |
 
 Token lookup order: `BYNH_TOKEN`, `BYNH_TOKEN_FILE`, `token`, `token_file`, then the systemd credential
 `$CREDENTIALS_DIRECTORY/bynh-token`. Values such as `true`, `false`, `1`, `0`, `yes` and `no` are
@@ -307,25 +333,43 @@ other than the monitored target. There is no telemetry, no crash reporting and n
   its checks.
 - **The token** is read from the environment, a file or a systemd credential. It is never accepted as
   a command-line argument by the installer, never logged (logs show `bynh_agt_…` and its last four
-  characters) and only sent to `api_url`. Debug logs replace `Authorization`, `Cookie` and similar
-  header values with `<redacted>`. Monitor credentials (basic and bearer auth) are never logged.
+  characters) and only sent to `api_url`, which must be https (or loopback) unless you explicitly set
+  `insecure_api_url`. Trace logs show header names only, never values, so API keys in monitor
+  headers stay out of logs. Monitor credentials are never logged, and config or assignment errors
+  report a line number or a fixed category, never the offending value. `BYNH_TOKEN` is removed from
+  the agent’s environment once read.
 - **Private addresses are refused by default.** Unless `allow_private = true`, the agent will not
   connect to loopback (`127.0.0.0/8`, `::1`), private (`10/8`, `172.16/12`, `192.168/16`), link-local
   (`169.254/16`, `fe80::/10`), carrier-grade NAT (`100.64/10`), multicast, unspecified, reserved and
-  benchmarking ranges, IPv6 unique local addresses (`fc00::/7`), cloud metadata endpoints
+  benchmarking ranges, documentation ranges (`192.0.2/24`, `198.51.100/24`, `203.0.113/24`,
+  `2001:db8::/32`, `3fff::/20`), the 6to4 relay anycast (`192.88.99/24`), Teredo (`2001::/32`),
+  local-use NAT64 (`64:ff9b:1::/48`), IPv6 unique local addresses (`fc00::/7`), cloud metadata endpoints
   (`169.254.169.254`, `fd00:ec2::254`), or any IPv6 address that embeds one of those IPv4 addresses
   (IPv4-mapped, IPv4-compatible, NAT64, 6to4). Such checks fail with the error kind `blocked`.
-  Platform agents always run with this on; bynh never assigns private targets to them.
+  Platform agents always run with this on; bynh never assigns private targets to them. An operator
+  can also list `deny_cidrs`, which are refused even when `allow_private` is on.
 - **No DNS rebinding.** Each host name is resolved once, the address is checked against the rules
   above, and the connection goes to that exact address.
 - **Every redirect is checked again.** Each hop is resolved and vetted the same way, so a public URL
-  can’t redirect the agent into your network. Credentials (`Authorization`, `Cookie`) are dropped when
-  a redirect leaves the original origin.
-- **Bounded work.** At most 1 MiB of each response body is read. Checks time out (2 minutes at most),
-  run under a concurrency limit, and the result buffer holds at most 10,000 results.
+  can’t redirect the agent into your network. When a redirect leaves the original origin, every
+  header configured on the monitor is dropped except `User-Agent`, `Accept`, `Accept-Language` and
+  `Accept-Encoding` (plus `Content-Type` when the body is kept), so credentials and API keys stay with
+  the site they were meant for. User info in a `Location` is discarded.
+- **Strict input.** Assignments are validated before anything runs: hosts must be IP addresses or
+  valid DNS names (no whitespace or control characters that could reach a request line), methods
+  come from the protocol’s list, and ids, URLs, headers, bodies and keywords have size limits. A
+  check that fails validation is skipped on its own. Monitors can’t set framing or connection
+  headers (`Host`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Upgrade`, `Expect`, `TE`,
+  `Proxy-*`).
+- **Bounded work.** At most 10,000 checks are accepted, platform responses are capped at 8 MiB
+  (also after decompression), at most 1 MiB of each response body is read (kept in memory only for
+  keyword checks), intervals are clamped to 1 s – 24 h and timeouts to 2 minutes, checks run under a
+  concurrency limit that also respects the open-file limit, and the result buffer holds at most
+  10,000 results.
 - **Least privilege when packaged.** The image is scratch-based, runs as UID 65532 and works with a
-  read-only root file system. The systemd unit uses a dynamic user with no capabilities, a read-only
-  system, restricted address families and system calls, and a 128 MB memory cap.
+  read-only root file system. The systemd unit uses a dynamic user in a private user namespace with
+  no capabilities or devices, a read-only system, restricted address families and system calls, and
+  a 128 MB memory cap.
 - **Proxies.** Proxy credentials are never logged. Checks bypass the proxy unless
   `check_via_proxy = true`, which requires `allow_private = true` because the final address can’t be
   vetted through a proxy (see [Outbound proxies](#outbound-proxies)).
@@ -334,6 +378,26 @@ other than the monitored target. There is no telemetry, no crash reporting and n
   certificate validation for that monitor only.
 
 Found a vulnerability? See [SECURITY.md](SECURITY.md).
+
+## Verifying releases
+
+Every release binary and `SHA256SUMS` carries a GitHub build-provenance attestation, and the image
+is signed with Sigstore (keyless) and ships an SBOM and provenance.
+
+```sh
+# a binary: checksum, then provenance (needs the GitHub CLI)
+sha256sum -c SHA256SUMS --ignore-missing
+gh attestation verify bynh-status-agent-x86_64-unknown-linux-musl --repo Dokan-E-Commerce/bynh-status-agent
+
+# the image
+cosign verify ghcr.io/dokan-e-commerce/bynh-status-agent:1.0.0 \
+  --certificate-identity-regexp '^https://github.com/Dokan-E-Commerce/bynh-status-agent/\.github/workflows/image\.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+gh attestation verify oci://ghcr.io/dokan-e-commerce/bynh-status-agent:1.0.0 --repo Dokan-E-Commerce/bynh-status-agent
+```
+
+Release builds use the toolchain pinned in `rust-toolchain.toml`, GitHub Actions pinned to commit
+SHAs, and base images pinned by digest. Dependencies are checked with `cargo deny` in CI.
 
 ## Allow-listing bynh’s checkers
 
@@ -356,9 +420,11 @@ machines you run them on, so allow those instead.
 
 - **http**: sends the request and compares the status with the monitor’s expected statuses (`2xx`,
   `3xx`, or exact codes such as `301`; none means any `2xx`). Redirects are followed up to the
-  monitor’s limit, re-checking each hop; 301/302 after a `POST` and every 303 continue as `GET`.
+  monitor’s limit (20 at most), re-checking each hop; 301/302 after a `POST` and every 303 continue
+  as `GET`. Monitor headers are dropped on a cross-origin hop (see the security model).
 - **keyword**: an http check that also requires a case-sensitive substring in the first 1 MiB of the
-  body (or its absence, with `keyword_absent`).
+  body (or its absence, with `keyword_absent`). It asks for an uncompressed response
+  (`Accept-Encoding: identity`) so the keyword is matched against the real text.
 - **tcp**: passes when a TCP connection to `host:port` opens.
 - **tls**: completes a TLS handshake and reports the certificate’s expiry; it fails if the certificate
   is expired or, with `verify_tls`, not trusted. The expiry is reported even when validation fails.

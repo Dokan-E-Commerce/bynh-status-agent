@@ -28,5 +28,9 @@ First release, implementing the bynh agent protocol v1.
 - Outbound proxy support (`proxy_url`, `no_proxy`, or `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`/`NO_PROXY`)
   for the platform connection, with `CONNECT` tunnels and basic proxy credentials; optional
   `check_via_proxy` for checks (requires `allow_private`).
+- Assignment validation and limits, `deny_cidrs`, a cross-origin header allowlist on redirects,
+  more reserved address ranges, and an opt-in (`insecure_api_url`) for a plain-http platform URL.
+- Signed releases: build-provenance attestations for binaries, a cosign-signed image with SBOM and
+  provenance, pinned actions, toolchain and base images, and `cargo deny` in CI.
 - Multi-arch scratch container image, hardened systemd unit, installer, Docker Compose and
   Kubernetes examples.

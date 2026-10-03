@@ -1,0 +1,45 @@
+# Optional egress policy for agents that must never reach internal networks
+# (for example platform agents, or an agent that only checks public sites).
+# Requires a CNI that enforces NetworkPolicy (Calico, Cilium, …).
+#
+# It allows DNS to the cluster resolver and HTTP(S)/any port to public
+# addresses only. Cloud metadata, RFC 1918, CGNAT, loopback, link-local and
+# IPv6 ULA/link-local ranges are excluded. Don't apply it to an own agent that
+# is meant to check in-cluster or internal services.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: bynh-status-agent-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: bynh-status-agent
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32
+              - 169.254.0.0/16
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 127.0.0.0/8
+        - ipBlock:
+            cidr: ::/0
+            except:
+              - fc00::/7
+              - fe80::/10
+              - ::1/128

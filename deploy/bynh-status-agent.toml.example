@@ -1,5 +1,6 @@
 # bynh-status-agent configuration (optional; BYNH_* environment variables override every key).
-# Default locations: /etc/bynh-status-agent/bynh-status-agent.toml, then ./bynh-status-agent.toml.
+# Default location: /etc/bynh-status-agent/bynh-status-agent.toml (or pass --config PATH).
+# deny_cidrs = ["169.254.169.254", "10.20.0.0/16"]   # never checked, even with allow_private
 
 # The agent token from Settings → Agents. Prefer BYNH_TOKEN, token_file or the
 # systemd credential over putting it here.
