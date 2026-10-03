@@ -22,7 +22,16 @@ pub const MAX_BODY: usize = 1 << 20;
 /// Upper bound on a check's timeout, whatever the platform sends.
 pub const MAX_TIMEOUT_MS: u64 = 120_000;
 
+/// A body sample is sent again at least this often per check, even when
+/// the body hasn't changed.
+pub const SAMPLE_REFRESH: Duration = Duration::from_secs(3600);
+
 pub struct Prober {
+    /// Per check id: SHA-256 of the body of the last sample sent, and when.
+    /// Bounded by the number of assigned checks; entries go when a check is
+    /// unassigned.
+    samples: std::sync::Mutex<std::collections::HashMap<String, (String, Instant)>>,
+    sample_refresh: Duration,
     net: Arc<Net>,
     guard: Guard,
     report_ip: bool,
@@ -51,10 +60,52 @@ fn other(msg: impl Into<String>) -> CheckError {
 impl Prober {
     pub fn new(net: Arc<Net>, guard: Guard, report_ip: bool) -> Self {
         Self {
+            samples: Default::default(),
+            sample_refresh: SAMPLE_REFRESH,
             net,
             guard,
             report_ip,
             proxy: None,
+        }
+    }
+
+    /// Changes how often an unchanged body is sampled again (tests).
+    pub fn with_sample_refresh(mut self, every: Duration) -> Self {
+        self.sample_refresh = every;
+        self
+    }
+
+    /// Forgets the last sample sent for `check_id` (the check was unassigned).
+    pub fn forget(&self, check_id: &str) {
+        self.samples
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(check_id);
+    }
+
+    /// Sends the body sample only when it is useful: the check failed, the
+    /// body changed since the last sample sent, the last one is older than
+    /// [`SAMPLE_REFRESH`], or none was sent yet. Otherwise the sample is
+    /// replaced by `sample_omitted: "unchanged"`.
+    fn dedupe_sample(&self, check_id: &str, failed: bool, details: &mut Details) {
+        let Some(body) = details.body.as_mut() else {
+            return;
+        };
+        let (Some(_), Some(sha)) = (&body.sample, &body.sha256) else {
+            return; // capture_body = false, or nothing to compare
+        };
+        let mut map = self.samples.lock().unwrap_or_else(|e| e.into_inner());
+        let send = failed
+            || match map.get(check_id) {
+                None => true,
+                Some((last, at)) => last != sha || at.elapsed() >= self.sample_refresh,
+            };
+        if send {
+            map.insert(check_id.to_owned(), (sha.clone(), Instant::now()));
+        } else {
+            body.sample = None;
+            body.sample_base64 = false;
+            body.sample_omitted = Some(details::SAMPLE_UNCHANGED);
         }
     }
 
@@ -95,7 +146,8 @@ impl Prober {
             || t.connect_ms.is_some()
             || t.tls_ms.is_some()
             || t.ttfb_ms.is_some();
-        let details = self.details(check, &mut out);
+        let mut details = self.details(check, &mut out);
+        self.dedupe_sample(&check.id, error.is_some(), &mut details);
         let mut result = CheckResult {
             check_id: check.id.clone(),
             started_at: rfc3339(started_at),

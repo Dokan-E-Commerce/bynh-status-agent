@@ -67,7 +67,14 @@ pub struct BodyDetails {
     pub size: Option<u64>,
     pub sha256: Option<String>,
     pub content_type: Option<String>,
+    /// `"unchanged"` when the sample was left out because the body is the
+    /// same as the last sample sent for this check within the hour.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_omitted: Option<&'static str>,
 }
+
+/// Value of `sample_omitted` for a body identical to the last sample sent.
+pub const SAMPLE_UNCHANGED: &str = "unchanged";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RedirectHop {
@@ -325,6 +332,7 @@ impl BodyCapture {
             size: Some(self.size),
             sha256,
             content_type,
+            sample_omitted: None,
         }
     }
 }

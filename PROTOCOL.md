@@ -123,7 +123,8 @@ The reference agent sends every field below with every result from 1.1.0 on; a v
     "truncated": true,
     "size": 196828,
     "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
-    "content_type": "text/html; charset=utf-8"
+    "content_type": "text/html; charset=utf-8",
+    "sample_omitted": "unchanged"        // only present when sample is null because the body is unchanged (see below)
   },
   "redirects": [ { "url": "https://shop.example.com/health", "status": 301, "duration_ms": 41, "remote_ip": "203.0.113.5" } ],
   "tls": {
@@ -151,6 +152,8 @@ The reference agent sends every field below with every result from 1.1.0 on; a v
   - `size`: body bytes read, capped at the read limit (1 MiB); the same as `response_bytes`. `0` for `HEAD`.
   - `sha256`: hex SHA-256 of the bytes read (up to the read limit).
   - `content_type`: the `Content-Type` header, or `null`.
+  - `sample_omitted`: `"unchanged"` when `sample` is `null` because the body is identical to the last sample sent for this check
+    within the hour (see Sample deduplication). Absent otherwise, including with `capture_body: false`.
 - **`redirects`**: one entry per redirect followed, in order, at most 10 (the last ones are kept). `url` is where that hop
   redirected to (the next URL requested, so the last entry holds the final URL), `status` the redirect status it answered with,
   `duration_ms` the time that hop took, `remote_ip` the address it came from (left out with `report_ip = false` or through a proxy).
@@ -170,6 +173,13 @@ The reference agent sends every field below with every result from 1.1.0 on; a v
 - **Body capture.** The agent reads up to its read cap (1 MiB) as before and keeps only the first 64 KiB as `sample`. The assignment
   field `"capture_body": true | false` (default `true` when absent) switches the sample: with `false` the agent sends
   `body: { "sample": null, "sample_base64": false, "truncated", "size", "sha256", "content_type" }` and never the content.
+- **Sample deduplication.** To keep volume down, the agent sends `sample` only when it is useful: the check failed (`ok: false`,
+  any error kind); the body's `sha256` differs from the body of the last sample it sent for this check id; more than 60 minutes
+  passed since the last sample it sent for this check; or it is the first result for this check since the agent started. Otherwise
+  `sample` is `null` and `sample_omitted` is `"unchanged"`: the platform's latest sample for the check is still accurate. Headers,
+  timings, TLS details, `size`, `sha256`, `content_type` and `truncated` are always sent. The agent keeps one entry per assigned
+  check (check id, SHA-256, time) in memory and drops it when the check is unassigned, so a reassigned check or a restarted agent
+  starts with a fresh sample. With `capture_body: false` nothing changes: `sample` is `null` and `sample_omitted` is absent.
 - **Redaction on the agent** (defence in depth; the platform redacts again). The values of `set-cookie`, `authorization`,
   `proxy-authorization`, `cookie` and `www-authenticate`, and of any header whose name contains `token`, `secret`, `key`,
   `session`, `auth`, `password` or `signature` (case-insensitive), are replaced with `"[redacted]"`; the name is kept. Exempt:

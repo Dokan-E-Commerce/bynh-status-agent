@@ -18,11 +18,16 @@ use crate::protocol::{Check, CheckResult};
 /// Anything that can run a check (the real [`Prober`], or a fake in tests).
 pub trait CheckRunner: Send + Sync + 'static {
     fn run(&self, check: &Check) -> impl Future<Output = CheckResult> + Send;
+    /// Called when a check is unassigned, to drop per-check state.
+    fn forget(&self, _check_id: &str) {}
 }
 
 impl CheckRunner for Prober {
     fn run(&self, check: &Check) -> impl Future<Output = CheckResult> + Send {
         Prober::run(self, check)
+    }
+    fn forget(&self, check_id: &str) {
+        Prober::forget(self, check_id)
     }
 }
 
@@ -128,8 +133,9 @@ impl<R: CheckRunner> Scheduler<R> {
                 }
             }
         }
-        for (_, old) in self.entries.drain() {
+        for (id, old) in self.entries.drain() {
             old.handle.abort();
+            self.runner.forget(&id);
             stats.removed += 1;
         }
         self.entries = next;
@@ -138,8 +144,9 @@ impl<R: CheckRunner> Scheduler<R> {
 
     /// Stops every timer (on 401, 426 and shutdown).
     pub fn stop_all(&mut self) {
-        for (_, e) in self.entries.drain() {
+        for (id, e) in self.entries.drain() {
             e.handle.abort();
+            self.runner.forget(&id);
         }
     }
 
@@ -272,6 +279,7 @@ mod tests {
         calls: AtomicUsize,
         active: AtomicUsize,
         max_active: AtomicUsize,
+        forgotten: std::sync::Mutex<Vec<String>>,
     }
 
     impl CheckRunner for Fake {
@@ -298,6 +306,9 @@ mod tests {
                 }
             }
         }
+        fn forget(&self, check_id: &str) {
+            self.forgotten.lock().unwrap().push(check_id.to_owned());
+        }
     }
 
     fn fake() -> Arc<Fake> {
@@ -305,6 +316,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             active: AtomicUsize::new(0),
             max_active: AtomicUsize::new(0),
+            forgotten: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -317,7 +329,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn keeps_unchanged_timers() {
         let buf = Arc::new(ResultBuffer::default());
-        let mut s = Scheduler::new(fake(), buf, 4);
+        let runner = fake();
+        let mut s = Scheduler::new(runner.clone(), buf, 4);
         let st = s.apply(vec![check("a", 60), check("b", 60), check("c", 60)]);
         assert_eq!(
             st,
@@ -340,8 +353,16 @@ mod tests {
         );
         assert_eq!(s.entries["a"].handle.id(), handle_a, "unchanged timer kept");
         assert_eq!(s.len(), 3);
+        assert_eq!(
+            *runner.forgotten.lock().unwrap(),
+            ["c"],
+            "removed check forgotten"
+        );
         s.stop_all();
         assert!(s.is_empty());
+        let mut all = runner.forgotten.lock().unwrap().clone();
+        all.sort();
+        assert_eq!(all, ["a", "b", "c", "d"]);
     }
 
     #[tokio::test(start_paused = true)]

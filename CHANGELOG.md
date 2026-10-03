@@ -17,6 +17,9 @@ All notable changes to this project are documented here. The format follows
   SANs, validity, SHA-256 fingerprint, chain length, verification result and reason) and
   `download_ms`/`total_ms` timings. Failures include everything gathered up to the failing phase.
 - The assignment field `capture_body` (default `true`) turns the body sample off per monitor.
+- Body samples are only sent when useful: on failure, when the body changed since the last sample
+  sent for the check, at least hourly, and on the first result after start. Otherwise the result
+  says `"sample_omitted": "unchanged"`.
 - `bynh-status-agent check` prints the details; `--no-body` leaves the body sample out.
 
 ### Security

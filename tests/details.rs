@@ -407,7 +407,11 @@ fn assert_details_shape(d: &Value) {
         assert!(pair[0].is_string() && pair[1].is_string());
     }
     let body = d["body"].as_object().unwrap();
-    let mut body_keys: Vec<&str> = body.keys().map(String::as_str).collect();
+    let mut body_keys: Vec<&str> = body
+        .keys()
+        .map(String::as_str)
+        .filter(|k| *k != "sample_omitted")
+        .collect();
     body_keys.sort_unstable();
     assert_eq!(
         body_keys,
@@ -456,6 +460,9 @@ async fn platform_receives_details() {
         let all: Vec<_> = s.results_calls.iter().flat_map(|c| &c.results).collect();
         all.iter().any(|r| r["check_id"] == "mon_page")
             && all.iter().any(|r| r["check_id"] == "mon_quiet")
+            && all.iter().any(|r| {
+                r["check_id"] == "mon_page" && r["details"]["body"]["sample_omitted"] == "unchanged"
+            })
     })
     .await;
     shutdown.cancel();
@@ -478,8 +485,149 @@ async fn platform_receives_details() {
     assert!(headers.contains(&json!(["set-cookie", "[redacted]"])));
     assert!(!page.to_string().contains("hunter"));
 
+    // Later results of the unchanged page leave the sample out.
+    let later = all
+        .iter()
+        .find(|r| r["check_id"] == "mon_page" && r["details"]["body"]["sample"].is_null())
+        .unwrap();
+    assert_details_shape(&later["details"]);
+    assert_eq!(later["details"]["body"]["sample_omitted"], "unchanged");
+    assert_eq!(later["details"]["body"]["sha256"], d["body"]["sha256"]);
+
     let quiet = all.iter().find(|r| r["check_id"] == "mon_quiet").unwrap();
     assert_details_shape(&quiet["details"]);
     assert!(quiet["details"]["body"]["sample"].is_null());
     assert_eq!(quiet["details"]["body"]["size"], PAGE.len());
+}
+
+fn sample_state(r: &CheckResult) -> (bool, Option<&'static str>) {
+    let b = r.details.as_ref().unwrap().body.as_ref().unwrap();
+    (b.sample.is_some(), b.sample_omitted)
+}
+
+const SENT: (bool, Option<&str>) = (true, None);
+const OMITTED: (bool, Option<&str>) = (false, Some("unchanged"));
+
+#[tokio::test]
+async fn samples_first_then_omits_unchanged() {
+    let t = spawn_target().await;
+    let p = prober();
+    let c = http(format!("http://{t}/page"));
+    let first = p.run(&c).await;
+    assert_eq!(sample_state(&first), SENT, "first result after start");
+    let second = p.run(&c).await;
+    assert!(second.ok);
+    assert_eq!(sample_state(&second), OMITTED);
+    let d = second.details.as_ref().unwrap();
+    let b = d.body.as_ref().unwrap();
+    // Everything but the sample is still there.
+    assert_eq!(b.size, Some(PAGE.len() as u64));
+    assert_eq!(
+        b.sha256,
+        first
+            .details
+            .as_ref()
+            .unwrap()
+            .body
+            .as_ref()
+            .unwrap()
+            .sha256
+    );
+    assert!(b.content_type.is_some() && !b.sample_base64 && !b.truncated);
+    assert!(!d.response_headers.is_empty() && d.timings.is_some());
+    let v = serde_json::to_value(&second).unwrap();
+    assert_eq!(v["details"]["body"]["sample_omitted"], "unchanged");
+    assert!(v["details"]["body"]["sample"].is_null());
+    // Present only when omitted.
+    let v = serde_json::to_value(&first).unwrap();
+    assert!(v["details"]["body"].get("sample_omitted").is_none());
+    // Per check id: another check gets its own first sample.
+    let mut other = c.clone();
+    other.id = "mon_other".into();
+    assert_eq!(sample_state(&p.run(&other).await), SENT);
+}
+
+#[tokio::test]
+async fn samples_when_the_body_changes() {
+    let t = spawn_target().await;
+    let p = prober();
+    let mut c = http(format!("http://{t}/page"));
+    assert_eq!(sample_state(&p.run(&c).await), SENT);
+    c.url = Some(format!("http://{t}/ok")); // same check, different body
+    assert_eq!(sample_state(&p.run(&c).await), SENT);
+    assert_eq!(sample_state(&p.run(&c).await), OMITTED);
+    c.url = Some(format!("http://{t}/page")); // back: differs from the last sent
+    assert_eq!(sample_state(&p.run(&c).await), SENT);
+}
+
+#[tokio::test]
+async fn samples_on_every_failure() {
+    let t = spawn_target().await;
+    let p = prober();
+    let c = http(format!("http://{t}/fail"));
+    for _ in 0..3 {
+        let r = p.run(&c).await;
+        assert!(!r.ok);
+        assert_eq!(sample_state(&r), SENT);
+    }
+    // A keyword failure on an otherwise unchanged body samples too.
+    let mut k = http(format!("http://{t}/page"));
+    k.kind = CheckType::Keyword;
+    k.keyword = Some("status: OK".into());
+    assert_eq!(sample_state(&p.run(&k).await), SENT);
+    assert_eq!(sample_state(&p.run(&k).await), OMITTED);
+    k.keyword = Some("maintenance".into());
+    let r = p.run(&k).await;
+    assert_eq!(r.error.as_ref().unwrap().kind, ErrorKind::Keyword);
+    assert_eq!(sample_state(&r), SENT);
+}
+
+#[tokio::test]
+async fn samples_again_after_the_refresh_interval() {
+    let t = spawn_target().await;
+    let p = prober().with_sample_refresh(Duration::from_millis(300));
+    let c = http(format!("http://{t}/page"));
+    assert_eq!(sample_state(&p.run(&c).await), SENT);
+    assert_eq!(sample_state(&p.run(&c).await), OMITTED);
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert_eq!(sample_state(&p.run(&c).await), SENT, "refreshed");
+    assert_eq!(sample_state(&p.run(&c).await), OMITTED);
+    assert_eq!(
+        bynh_status_agent::probe::SAMPLE_REFRESH,
+        Duration::from_secs(3600)
+    );
+}
+
+#[tokio::test]
+async fn unassigning_a_check_forgets_its_sample() {
+    let t = spawn_target().await;
+    let p = prober();
+    let c = http(format!("http://{t}/page"));
+    assert_eq!(sample_state(&p.run(&c).await), SENT);
+    assert_eq!(sample_state(&p.run(&c).await), OMITTED);
+    p.forget("mon_other");
+    assert_eq!(
+        sample_state(&p.run(&c).await),
+        OMITTED,
+        "other ids untouched"
+    );
+    p.forget(&c.id);
+    assert_eq!(sample_state(&p.run(&c).await), SENT);
+}
+
+#[tokio::test]
+async fn capture_body_false_never_marks_omitted() {
+    let t = spawn_target().await;
+    let p = prober();
+    let mut c = http(format!("http://{t}/page"));
+    c.capture_body = false;
+    for _ in 0..2 {
+        let r = p.run(&c).await;
+        assert_eq!(sample_state(&r), (false, None));
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v["details"]["body"].get("sample_omitted").is_none());
+    }
+    // Turning capture back on starts with a sample (none was sent before).
+    c.capture_body = true;
+    assert_eq!(sample_state(&p.run(&c).await), SENT);
 }

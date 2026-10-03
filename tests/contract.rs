@@ -161,6 +161,7 @@ fn full_details() -> Details {
             size: Some(2),
             sha256: Some("00".into()),
             content_type: Some("text/plain".into()),
+            sample_omitted: Some("unchanged"),
         }),
         redirects: vec![RedirectHop {
             url: "https://shop.example.com/health".into(),

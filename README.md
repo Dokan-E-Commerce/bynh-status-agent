@@ -350,6 +350,13 @@ always has the headers and the body sample, a timeout during the body has what a
 certificate that fails verification is still described. Each result stays under 128 KiB: the body
 sample is shortened first, then headers are dropped.
 
+**Only useful samples.** To keep traffic down, a result carries the body sample only when the check
+failed, the body changed since the last sample sent for that check (compared by SHA-256), the last
+sample is more than an hour old, or it is the first result for the check since the agent started.
+Otherwise the body is described by its size, hash and content type with `"sample_omitted": "unchanged"`,
+and bynh keeps showing the last sample, which is still accurate. Headers, timings and TLS details are
+always sent.
+
 **Body capture.** Body samples are on by default. Turn them off per monitor in bynh (the
 assignment field `capture_body: false`) for pages that show personal or confidential data: the agent
 then sends the size, hash and content type of the body, never its content. Keyword checks keep
