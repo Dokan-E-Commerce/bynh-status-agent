@@ -11,7 +11,7 @@
 
 # Pinned by digest; Dependabot keeps it current. Same toolchain as
 # rust-toolchain.toml.
-FROM rust:1.97.1-alpine3.22@sha256:df4efa4e0cdfb5245fa06e3f431387b2bcc96782ce5681b7fb6b0297d745bc29 AS build
+FROM rust:1.98.1-alpine3.22@sha256:a1796ca6fa216d6727b5f61c69e4c665b120b1a4dcb969639e2f25f1ed309456 AS build
 RUN apk add --no-cache musl-dev ca-certificates
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
