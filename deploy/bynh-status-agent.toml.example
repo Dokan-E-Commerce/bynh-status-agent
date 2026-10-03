@@ -1,0 +1,17 @@
+# bynh-status-agent configuration (optional; BYNH_* environment variables override every key).
+# Default locations: /etc/bynh-status-agent/bynh-status-agent.toml, then ./bynh-status-agent.toml.
+
+# The agent token from Settings → Agents. Prefer BYNH_TOKEN, token_file or the
+# systemd credential over putting it here.
+# token = "bynh_agt_…"
+# token_file = "/run/secrets/bynh_token"
+
+api_url = "https://api.bynh.io"
+allow_private = false   # true for on-premise agents checking internal hosts
+report_ip = true
+send_hostname = true
+concurrency = 64
+
+# log = "info"          # or debug, warn, a filter such as "bynh_status_agent=debug"
+# log_format = "human"  # or json
+# ca_file = "/etc/bynh-status-agent/internal-ca.pem"
